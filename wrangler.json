@@ -70,7 +70,7 @@
 		 */
 		"AI_MOCK": "false",
 		"AUTH_SECRET": "dev-only-insecure-set-via-wrangler-secret-in-prod",
-		"MODEL_DETECT": "@cf/facebook/detr-resnet-50",
+		"MODEL_DETECT_MOONDREAM": "@cf/moondream/moondream3.1-9B-A2B",
 		"MODEL_VLM": "@cf/meta/llama-3.2-11b-vision-instruct",
 		"MODEL_VLM_SECONDARY": "@cf/zai-org/glm-5.3-flash",
 		"MODEL_EDIT": "@cf/black-forest-labs/flux-2-klein-9b",

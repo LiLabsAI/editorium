@@ -14,7 +14,7 @@ export function getProvider(env: Env): AIProvider {
 		return new MockProvider();
 	}
 	return new WorkersAIProvider(env.AI, {
-		detect: env.MODEL_DETECT,
+		moondream: env.MODEL_DETECT_MOONDREAM,
 		vlm: env.MODEL_VLM,
 		vlmSecondary: env.MODEL_VLM_SECONDARY,
 		t2i: env.MODEL_T2I,

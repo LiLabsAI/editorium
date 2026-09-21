@@ -1,4 +1,3 @@
-import { imageDimensions } from "../r2";
 import {
 	type AIProvider,
 	type DetectedBox,
@@ -6,6 +5,25 @@ import {
 	type RegionCaption,
 	ProviderError,
 } from "./types";
+
+function normalizeMoondreamBox(
+	o: unknown,
+	label: string,
+): DetectedBox | null {
+	const nums = Array.isArray(o)
+		? (o as number[])
+		: (() => {
+				const rec = o as Record<string, number>;
+				return [rec.x_min ?? rec.xmin ?? rec.x, rec.y_min ?? rec.ymin ?? rec.y, rec.x_max ?? rec.xmax ?? rec.w, rec.y_max ?? rec.ymax ?? rec.h];
+			})();
+	if (!Array.isArray(nums) || nums.length < 4 || nums.some((n) => typeof n !== "number" || Number.isNaN(n))) return null;
+	const [x, y, w, h] = nums;
+	// Accept both corner (x,y,x_max,y_max) and box (x,y,w,h) forms, then normalize
+	if (w <= 1.5 && h <= 1.5) {
+		return { label, x, y, w, h, score: 0.8 };
+	}
+	return { label, x, y, w: w - x, h: h - y, score: 0.8 };
+}
 
 /**
  * Workers AI binding implementation. Model IDs come from wrangler vars so they
@@ -24,7 +42,7 @@ export class WorkersAIProvider implements AIProvider {
 	constructor(
 		private readonly ai: Ai,
 		private readonly models: {
-			detect: string;
+			moondream: string;
 			vlm: string;
 			vlmSecondary?: string;
 			t2i: string;
@@ -128,33 +146,104 @@ export class WorkersAIProvider implements AIProvider {
 	}
 
 	async detect(image: ArrayBuffer, mime: string): Promise<DetectedBox[]> {
-		void mime;
-		// DETR schema (empirically verified in production 2026-09-20): input is
-		// { image: [8-bit ints] }; output is an array of PIXEL-space boxes.
-		const bytes = new Uint8Array(image);
-		const dims = imageDimensions(image) ?? { width: 1024, height: 1024 };
-		const run = (this.ai as { run: (m: string, input: unknown) => Promise<unknown> }).run;
-		const out = await run.call(this.ai, this.models.detect, {
-			image: Array.from(bytes),
-		});
-		const items = (Array.isArray(out) ? out : []) as Array<{
-			label?: string;
-			score?: number;
-			box?: { xmin: number; ymin: number; xmax: number; ymax: number };
-		}>;
-		return items
-			.filter((i) => i.box && i.label)
-			.map((i) => ({
-				label: i.label!.toLowerCase(),
-				x: i.box!.xmin / dims.width,
-				y: i.box!.ymin / dims.height,
-				w: (i.box!.xmax - i.box!.xmin) / dims.width,
-				h: (i.box!.ymax - i.box!.ymin) / dims.height,
-				score: i.score ?? 0.5,
-			}))
+		const dataUrl = await this.toDataUrl(image, mime);
+
+		// Moondream-only detection (user decision, 2026-09-21):
+		// 1. discover open-vocabulary object names (works today)
+		// 2. per-name detect → bounding boxes (broken platform-side; returns
+		//    empty until Cloudflare fixes it — auto-detection stays off in the
+		//    product until then)
+		const names = await this.moondreamNames(dataUrl);
+		const boxes: DetectedBox[] = [];
+		for (const name of names.slice(0, 12)) {
+			try {
+				boxes.push(...(await this.moondreamDetectBoxes(dataUrl, name)));
+			} catch {
+				// skip un-detectable names
+			}
+		}
+		return boxes
 			.filter((b) => b.w > 0.01 && b.h > 0.01)
-			.sort((a, b) => b.score - a.score)
-			.slice(0, 24);
+			.sort((a, b) => b.score - a.score);
+	}
+
+	/** Collect the full text of a Moondream SSE stream. */
+	private async moondreamStreamText(model: string, input: unknown): Promise<string> {
+		const runAi = this.ai as { run: (m: string, input: unknown) => Promise<unknown> };
+		const out = await runAi.run(model, input);
+		if (!(out instanceof ReadableStream)) {
+			return typeof out === "string" ? out : JSON.stringify(out);
+		}
+		return await new Response(out).text();
+	}
+
+	/** task=query → JSON array of visible object names. */
+	private async moondreamNames(dataUrl: string): Promise<string[]> {
+		try {
+			const buf = await this.moondreamStreamText(this.models.moondream, {
+				task: "query",
+				image: dataUrl,
+				question:
+					'List every visible object in this image as a short JSON array of names, e.g. ["man","dog","couch"].',
+			});
+			const lines = buf
+				.split("\n")
+				.filter((l) => l.startsWith("data:"))
+				.map((l) => l.slice(5).trim())
+				.filter((l) => l && l !== "[DONE]");
+			let answer = "";
+			for (const line of lines) {
+				try {
+					const chunk = JSON.parse(line) as { answer?: string; finish_reason?: string };
+					if (chunk.answer) answer = chunk.answer;
+					if (chunk.finish_reason === "stop" && chunk.answer) answer = chunk.answer;
+				} catch {
+					// partial frame
+				}
+			}
+			const parsed = JSON.parse(answer) as unknown;
+			if (!Array.isArray(parsed)) return [];
+			return parsed
+				.filter((n): n is string => typeof n === "string" && n.trim().length > 0)
+				.map((n) => n.trim().toLowerCase().slice(0, 32));
+		} catch {
+			return [];
+		}
+	}
+
+	/** task=detect → boxes for one named object (empty while broken upstream). */
+	private async moondreamDetectBoxes(
+		dataUrl: string,
+		name: string,
+	): Promise<DetectedBox[]> {
+		try {
+			const buf = await this.moondreamStreamText(this.models.moondream, {
+				task: "detect",
+				image: dataUrl,
+				question: name,
+			});
+			const lines = buf
+				.split("\n")
+				.filter((l) => l.startsWith("data:"))
+				.map((l) => l.slice(5).trim())
+				.filter((l) => l && l !== "[DONE]");
+			let objects: unknown = null;
+			for (const line of lines) {
+				try {
+					const chunk = JSON.parse(line) as { objects?: unknown };
+					if (chunk.objects) objects = chunk.objects;
+				} catch {
+					// partial frame
+				}
+			}
+			if (!Array.isArray(objects)) return [];
+			// Defensive: accept [x,y,w,h] arrays or {x_min..} objects, normalized 0..1
+			return objects
+				.map((o) => normalizeMoondreamBox(o, name))
+				.filter((b): b is DetectedBox => b !== null);
+		} catch {
+			return [];
+		}
 	}
 
 	async detectFaceDetails(
