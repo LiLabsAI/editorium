@@ -1,0 +1,82 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "editorium",
+	"main": "./src/worker/index.ts",
+	"compatibility_date": "2026-07-14",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"observability": {
+		"enabled": true,
+		"head_sampling_rate": 0.1
+	},
+	"upload_source_maps": true,
+	"assets": {
+		"directory": "./dist/client",
+		"not_found_handling": "single-page-application"
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "editorium-db",
+			"database_id": "5c05fada-080e-4f7e-a301-592264245d95",
+			"migrations_dir": "drizzle"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "MEDIA",
+			"bucket_name": "editorium-media"
+		}
+	],
+	"ai": {
+		"binding": "AI"
+	},
+	"images": {
+		"binding": "IMAGES"
+	},
+	"queues": {
+		"producers": [
+			{
+				"binding": "AI_JOBS",
+				"queue": "editorium-ai-jobs"
+			}
+		],
+		"consumers": [
+			{
+				"queue": "editorium-ai-jobs",
+				"max_batch_size": 1,
+				"max_retries": 3,
+				"max_batch_timeout": 5
+			}
+		]
+	},
+	"workflows": [
+		{
+			"name": "editorium-segment",
+			"binding": "SEGMENT_WORKFLOW",
+			"class_name": "SegmentWorkflow"
+		}
+	],
+	"vars": {
+		/**
+		 * AI_MOCK=true keeps every AI call local and deterministic (no account
+		 * usage). Flip to "false" and run `wrangler dev` while logged in to use
+		 * the real Workers AI models below.
+		 */
+		"AI_MOCK": "false",
+		"AUTH_SECRET": "dev-only-insecure-set-via-wrangler-secret-in-prod",
+		"MODEL_DETECT": "@cf/facebook/detr-resnet-50",
+		"MODEL_VLM": "@cf/meta/llama-3.2-11b-vision-instruct",
+		"MODEL_VLM_SECONDARY": "@cf/google/gemma-4-26b-a4b-it",
+		"MODEL_EDIT": "@cf/black-forest-labs/flux-2-klein-9b",
+		"MODEL_T2I": "@cf/black-forest-labs/flux-1-schnell",
+		"MODEL_INPAINT": "@cf/runwayml/stable-diffusion-v1-5-inpainting",
+		"MODEL_IMG2IMG": "@cf/bytedance/stable-diffusion-xl-lightning",
+		"MODEL_LLM": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+	}
+}

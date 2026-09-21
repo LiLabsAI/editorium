@@ -1,0 +1,1 @@
+ALTER TABLE `jobs` ADD `result_image_id` text;

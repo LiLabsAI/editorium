@@ -1,0 +1,7 @@
+# E2E: share links
+
+1. Editor top bar -> Share -> link copied
+2. Open /s/:token in a logged-out context
+   ASSERT: image renders with download button and "Made with Editorium"
+3. Revoke the link (owner)
+   ASSERT: /s/:token shows "expired or revoked"

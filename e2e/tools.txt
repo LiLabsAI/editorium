@@ -1,0 +1,12 @@
+# E2E: editor tools
+
+1. MARQUEE tool: drag across two regions
+   ASSERT: both rows highlighted; bulk bar shows "2 selected"
+   CLICK "Lock all" -> padlocks visible; "Delete all" -> rows removed
+2. PEN tool: draw a closed loop on an empty area
+   ASSERT: "custom region" appears in the tree; select + prompt + regenerate works
+3. TEXT tool: click canvas, type text
+   ASSERT: annotation renders at the click point; persists after reload
+4. DUPLICATE: album gains "<label> copy" and the editor navigates to it
+5. IMAGES: switcher overlay lists album images; picking one swaps the editor
+6. FULLSCREEN: chrome hides; Esc restores
