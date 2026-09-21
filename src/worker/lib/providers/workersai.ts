@@ -403,9 +403,11 @@ export class WorkersAIProvider implements AIProvider {
 				// fall through to SDXL-lightning
 			}
 		}
+		// SDXL-lightning validates `image` as an INT ARRAY — the b64 string form
+		// fails with "input tensor `image` is not present in the model".
 		const result = await this.runImageModel(this.models.img2img, {
 			prompt,
-			image_b64: b64,
+			image: Array.from(new Uint8Array(base64ToArrayBuffer(b64))),
 			strength,
 			num_steps: 6,
 			guidance: 3,
