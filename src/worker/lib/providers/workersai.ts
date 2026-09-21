@@ -47,7 +47,6 @@ export class WorkersAIProvider implements AIProvider {
 			vlmSecondary?: string;
 			t2i: string;
 			llm: string;
-			inpaint: string;
 			img2img: string;
 			edit?: string;
 		},
@@ -421,53 +420,44 @@ export class WorkersAIProvider implements AIProvider {
 	async inpaint(
 		image: ArrayBuffer,
 		mime: string,
-		mask: ArrayBuffer | null,
+		_mask: ArrayBuffer | null,
 		box: { x: number; y: number; w: number; h: number },
 		prompt: string,
 		dims?: { width: number; height: number },
 	): Promise<GeneratedImage> {
-		const width = round8(Math.min(1024, Math.max(256, dims?.width ?? 512)));
-		const height = round8(Math.min(1024, Math.max(256, dims?.height ?? 512)));
+		void box;
+		void _mask;
+		const b64 = (await this.toDataUrl(image, mime)).replace(/^data:[^,]+,/, "");
+		const width = String(Math.min(1024, Math.max(256, dims?.width ?? 1024)));
+		const height = String(Math.min(1024, Math.max(256, dims?.height ?? 1024)));
 
-		// Primary path: FLUX.2 klein instruction edit — it follows prompts far
-		// better than SD-v1.5 inpainting, whose masked output was often
-		// indistinguishable from the input. The preservation clause keeps the
-		// rest of the photograph stable.
+		// Primary: FLUX.2 klein instruction edit (best prompt-following).
 		if (this.models.edit) {
 			try {
-				const b64 = (await this.toDataUrl(image, mime)).replace(/^data:[^,]+,/, "");
 				const edited = await this.runMultipartEdit(this.models.edit, {
-					prompt: `${prompt}. Edit only the region described; keep the person, ` +
-						`animals, background, lighting, and composition otherwise exactly unchanged.`,
+					prompt,
 					image: b64,
-					width: String(width),
-					height: String(height),
+					width,
+					height,
 				});
-				if (edited) return { ...edited, width, height };
+				if (edited) return { ...edited, width: Number(width), height: Number(height) };
 			} catch {
-				// fall through to the mask model
+				// fall through
 			}
 		}
-
-		if (mask) {
-			const dataUrl = (await this.toDataUrl(image, mime)).replace(/^data:[^,]+,/, "");
-			const result = await this.runImageModel(this.models.inpaint, {
-				prompt,
-				image_b64: dataUrl.replace(/^data:[^,]+,/, ""),
-				mask: Array.from(new Uint8Array(mask)),
-				strength: 1.0,
-				num_steps: 12,
-				guidance: 7.5,
-				width,
-				height,
-			});
-			if (result) {
-				return { ...result, width, height };
+		// Fallback 1: SDXL-lightning multipart img2img (validated shape).
+		if (this.models.img2img) {
+			try {
+				const edited = await this.runMultipartEdit(this.models.img2img, {
+					prompt,
+					image: b64,
+				});
+				if (edited) return { ...edited, width: Number(width), height: Number(height) };
+			} catch {
+				// fall through to final error
 			}
 		}
-		// Fallback: whole-frame img2img constrained by low strength.
-		return this.imageToImage(image, mime, prompt, 0.5);
-		void box;
+		throw new ProviderError("All editing models failed", true);
 	}
 
 	async upscale(
@@ -590,10 +580,6 @@ export class WorkersAIProvider implements AIProvider {
 	}
 }
 
-
-function round8(n: number): number {
-	return Math.max(256, Math.round(n / 8) * 8);
-}
 
 function aspectSize(aspect: string): [number, number] {
 	switch (aspect) {

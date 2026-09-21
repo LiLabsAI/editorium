@@ -19,7 +19,6 @@ export function getProvider(env: Env): AIProvider {
 		vlmSecondary: env.MODEL_VLM_SECONDARY,
 		t2i: env.MODEL_T2I,
 		llm: env.MODEL_LLM,
-		inpaint: env.MODEL_INPAINT,
 		img2img: env.MODEL_IMG2IMG,
 		edit: env.MODEL_EDIT,
 	});
