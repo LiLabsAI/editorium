@@ -164,3 +164,32 @@ Bugs found & fixed during verification:
 
 Known limit (unchanged): the batch edit is a single whole-frame FLUX edit, so
 the composition re-renders; pixel-local compositing stays the phase-4 step.
+
+
+## Moondream 3.1 investigation (user suggestion, 2026-09-21)
+
+User proposed `@cf/moondream/moondream3.1-9B-A2B` for object detection.
+
+**Catalog facts (verified):** Image-to-Text vision model, 9B MoE / 2B active.
+Tasks: `query`, `caption`, `point`, `detect` — detect "returns bounding boxes
+for objects matching a target phrase". Token pricing ($0.30/M in, $1.00/M out).
+Open vocabulary — not limited to COCO classes.
+
+**Live probe results (production binding, real photo):**
+- `query` ✅ — open-vocabulary object discovery works: returned
+  `["man", "dog", "couch", "pillows", "floor lamp", "wall", "pictures"]`
+  (~160ms-class latency, 746 in / 62 out tokens). This names objects DETR
+  cannot ("pillows", "floor lamp").
+- `detect` ❌ — returns empty `response` + 0 neurons across 5 phrasings
+  (specific "the couch"/"the dog"/"couch", generic "objects"). Platform-side
+  issue; the detect head never fires.
+- `point` ❌ — same empty-result behavior.
+
+**Verdict:**
+- resnet-50 is image CLASSIFICATION (one label per image, no boxes) — it can
+  never replace detection; DETR remains our only box source.
+- Moondream `query` is the best open-vocabulary DISCOVERY signal in the
+  catalog and should feed the detector once region features return.
+- Moondream `detect` would be the ideal box source when the platform bug is
+  fixed — retest periodically. Until then: DETR (boxes) + GLM (labels) +
+  Moondream query (discovery, when re-enabled) is the architecture.
