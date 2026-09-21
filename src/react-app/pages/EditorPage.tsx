@@ -40,8 +40,6 @@ export function EditorPage({ projectName }: { projectName: string }) {
 	}, [albumId, imageId]);
 
 	useEffect(() => {
-		// Initial data fetch on mount — the legitimate effect use case.
-		// eslint-disable-next-line react-hooks/set-state-in-effect
 		loadAll();
 	}, [loadAll]);
 
@@ -88,6 +86,53 @@ export function EditorPage({ projectName }: { projectName: string }) {
 			}
 		} catch (err) {
 			setApplying("Edit failed: " + (err instanceof Error ? err.message : String(err)));
+			await new Promise((r) => setTimeout(r, 4000));
+		}
+		setApplying(null);
+	}
+
+	/** Deterministic pixel presets (B&W, golden hour): perfect composition,
+	 * instant, free — no AI model needed for color transforms. Creates a
+	 * branched photo like every other edit. */
+	async function applyFilter(kind: "bw" | "golden", label: string) {
+		if (!image || !albumId || applying) return;
+		setApplying(label + "…");
+		try {
+			const img = new Image();
+			img.crossOrigin = "anonymous";
+			img.src = fileUrl(image.id, "original", image.currentVersionId ?? undefined);
+			await new Promise((res, rej) => {
+				img.onload = res;
+				img.onerror = () => rej(new Error("Could not load photo"));
+			});
+			const canvas = document.createElement("canvas");
+			canvas.width = img.naturalWidth;
+			canvas.height = img.naturalHeight;
+			const ctx = canvas.getContext("2d");
+			if (!ctx) throw new Error("Canvas unavailable");
+			ctx.drawImage(img, 0, 0);
+			const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
+			const px = data.data;
+			for (let i = 0; i < px.length; i += 4) {
+				const r = px[i]!, g = px[i + 1]!, b = px[i + 2]!;
+				if (kind === "bw") {
+					const l = 0.299 * r + 0.587 * g + 0.114 * b;
+					px[i] = px[i + 1] = px[i + 2] = l;
+				} else {
+					// golden hour: warm shift + gentle lift
+					px[i] = Math.min(255, r * 1.12 + 12);
+					px[i + 1] = Math.min(255, g * 1.02 + 6);
+					px[i + 2] = b * 0.86;
+				}
+			}
+			ctx.putImageData(data, 0, 0);
+			const blob = await new Promise<Blob>((res, rej) =>
+				canvas.toBlob((b) => (b ? res(b) : rej(new Error("toBlob failed"))), "image/png"),
+			);
+			const { imageId: newId } = await api.filterBranch(image.id, label, blob);
+			navigate(`/albums/${albumId}/images/${newId}`);
+		} catch (err) {
+			setApplying("Filter failed: " + (err instanceof Error ? err.message : String(err)));
 			await new Promise((r) => setTimeout(r, 4000));
 		}
 		setApplying(null);
@@ -195,21 +240,34 @@ export function EditorPage({ projectName }: { projectName: string }) {
 					</div>
 					<div className="space-y-2 p-4 pt-0">
 						<div className="flex flex-wrap gap-1.5">
-							{[
-								{ label: "✦ Enhance", prompt: "enhance this photo to crisp high resolution, like a professional camera shot it" },
-								{ label: "Remove background", prompt: "replace the background with a clean white studio backdrop" },
-								{ label: "Black & white", prompt: "convert this photo to dramatic black and white film" },
-								{ label: "Golden hour", prompt: "make it look like warm golden hour sunlight" },
-							].map((p) => (
-								<button
-									key={p.label}
-									disabled={applying !== null}
-									onClick={() => sendEdit(p.prompt)}
-									className="rounded-full border ed-hairline bg-secondary px-3 py-1.5 text-xs transition hover:bg-muted disabled:opacity-40"
-								>
-									{p.label}
-								</button>
-							))}
+							<button
+								disabled={applying !== null}
+								onClick={() => applyFilter("bw", "Black & white")}
+								className="rounded-full border ed-hairline bg-secondary px-3 py-1.5 text-xs transition hover:bg-muted disabled:opacity-40"
+							>
+								Black & white
+							</button>
+							<button
+								disabled={applying !== null}
+								onClick={() => applyFilter("golden", "Golden hour")}
+								className="rounded-full border ed-hairline bg-secondary px-3 py-1.5 text-xs transition hover:bg-muted disabled:opacity-40"
+							>
+								Golden hour
+							</button>
+							<button
+								disabled={applying !== null}
+								onClick={() => sendEdit("enhance this photo: increase sharpness, clarity and detail, professional camera quality")}
+								className="rounded-full border ed-hairline bg-secondary px-3 py-1.5 text-xs transition hover:bg-muted disabled:opacity-40"
+							>
+								✦ Enhance (AI)
+							</button>
+							<button
+								disabled={applying !== null}
+								onClick={() => sendEdit("remove the background completely, replace it with a clean white studio backdrop, keep the subject unchanged")}
+								className="rounded-full border ed-hairline bg-secondary px-3 py-1.5 text-xs transition hover:bg-muted disabled:opacity-40"
+							>
+								Remove background (AI)
+							</button>
 						</div>
 						{versions.length > 1 && (
 							<select

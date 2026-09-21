@@ -471,6 +471,56 @@ async function deriveVariantsFromVersion(
 	void keys;
 }
 
+// Client-side filter preset → branched photo (B&W, golden hour: deterministic
+// pixel transforms, composition-perfect, no AI model needed).
+api.post("/images/:id/filter-branch", async (c) => {
+	const user = await requireUser(c);
+	const row = await ownedImage(c, c.env, user.id);
+	if (!row) return c.json({ error: "not_found" }, 404);
+	const form = await c.req.parseBody();
+	const file = form["file"];
+	const label = String(form["label"] ?? "Filtered");
+	if (!(file instanceof File)) return c.json({ error: "file_required" }, 400);
+	const bytes = await file.arrayBuffer();
+	if (bytes.byteLength === 0 || bytes.byteLength > 15 * 1024 * 1024) {
+		return c.json({ error: "invalid_file" }, 400);
+	}
+	if (!(await rateLimit(c.env, user.id, row.image.id, 20))) {
+		return c.json({ error: "rate_limited" }, 429);
+	}
+	const db = createDb(c.env.DB);
+	const imageId = crypto.randomUUID();
+	const versionId = crypto.randomUUID();
+	const keys = mediaKeys(user.id, row.album.id, imageId);
+	const r2Key = keys.original("png");
+	await c.env.MEDIA.put(r2Key, bytes, {
+		httpMetadata: { contentType: "image/png", cacheControl: "public, max-age=31536000, immutable" },
+	});
+	const { images: imagesTable } = await import("../../../database/schema");
+	await db.insert(imagesTable).values({
+		id: imageId,
+		albumId: row.album.id,
+		kind: "edited",
+		r2KeyOriginal: r2Key,
+		mime: "image/png",
+		widthPx: row.image.widthPx,
+		heightPx: row.image.heightPx,
+		sizeBytes: bytes.byteLength,
+		sourceImageId: row.image.id,
+		filenameLabel: label.slice(0, 60),
+		segmentStatus: "none",
+	});
+	await db.insert(imageVersions).values({
+		id: versionId,
+		imageId,
+		label,
+		r2KeyFull: r2Key,
+		operation: "filter",
+	});
+	await db.update(imagesTable).set({ currentVersionId: versionId }).where(eq(imagesTable.id, imageId));
+	return c.json({ imageId, versionId }, 201);
+});
+
 // Direct whole-photo instruction edit (rebuild step 0 core loop).
 api.post("/images/:id/edit", async (c) => {
 	const user = await requireUser(c);
@@ -1333,3 +1383,49 @@ api.get("/segments/:id/crop", async (c) => {
 });
 
 // TEMPORARY probe: bisect the edit chain (klein multipart / SDXL / SD-inpaint). Remove after.
+
+// TEMPORARY probe: Pruna P-Image shapes. Remove after verification.
+api.post("/ai-debug/pruna", async (c) => {
+	await requireUser(c);
+	const body = await c.req.json<{ imageB64: string }>().catch(() => null);
+	if (!body?.imageB64) return c.json({ error: "imageB64 required" }, 400);
+	const b64 = body.imageB64.replace(/^data:[^,]+,/, "");
+	const ai = c.env.AI as unknown as { run: (m: string, input: unknown) => Promise<unknown> };
+	const results: Record<string, unknown> = {};
+
+	// SDXL-lightning multipart img2img B&W test — full result returned for
+	// visual verification (composition preservation check).
+	try {
+		const form = new FormData();
+		form.append("prompt", "convert this photo to dramatic black and white film");
+		form.append("image", b64);
+		form.append("strength", "0.55");
+		form.append("num_steps", "6");
+		form.append("guidance", "3");
+		form.append("width", "1024");
+		form.append("height", "1024");
+		const probeReq = new Request("https://x.local", { method: "POST", body: form });
+		const out = await ai.run("@cf/bytedance/stable-diffusion-xl-lightning", {
+			multipart: { body: probeReq.body, contentType: probeReq.headers.get("content-type") || "multipart/form-data" },
+		});
+		let b64Out: string;
+		if (out instanceof ReadableStream) {
+			const buf = await new Response(out).arrayBuffer();
+			const bytes = new Uint8Array(buf);
+			let bin = "";
+			for (let i = 0; i < bytes.length; i += 0x8000) {
+				bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+			}
+			b64Out = btoa(bin);
+		} else if (out && typeof out === "object" && "image" in (out as object)) {
+			b64Out = (out as { image: string }).image;
+		} else {
+			b64Out = "UNEXPECTED: " + JSON.stringify(out).slice(0, 200);
+		}
+		results.sdxlBw = b64Out.slice(0, 60) + "…len=" + b64Out.length;
+		results.imageB64Out = b64Out;
+	} catch (e) {
+		results.sdxlBw = "ERR: " + (e instanceof Error ? e.message.slice(0, 220) : String(e));
+	}
+	return c.json({ results, imageB64Out: results.imageB64Out ?? null });
+});

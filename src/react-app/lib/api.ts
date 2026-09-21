@@ -210,6 +210,14 @@ export const api = {
 
 	branchFamily: (imageId: string) =>
 		request<{ images: ImageDto[] }>(`/images/${imageId}/branch`),
+	filterBranch: async (imageId: string, label: string, blob: Blob) => {
+		const form = new FormData();
+		form.append("file", blob, "filtered.png");
+		form.append("label", label);
+		const res = await fetch(`/api/images/${imageId}/filter-branch`, { method: "POST", body: form });
+		if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error ?? "filter failed");
+		return (await res.json()) as { imageId: string; versionId: string };
+	},
 	editImage: (imageId: string, prompt: string) =>
 		request<{ jobId: string }>(`/images/${imageId}/edit`, {
 			method: "POST",
