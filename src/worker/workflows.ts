@@ -102,9 +102,49 @@ export async function runWholePhotoEdit(
 	userId: string,
 	source: typeof images.$inferSelect,
 	prompt: string,
+	origin?: string,
 ): Promise<{ imageId: string; versionId: string }> {
 	const provider = getProvider(env);
 	const { bytes, mime } = await loadImageBytes(env, source);
+
+	// Primary: Pruna P-Image-Edit (instruction-based editing that preserves
+	// the input composition). Needs a publicly fetchable signed URL.
+	if (origin) {
+		try {
+			const { signPublicImageUrl } = await import("./lib/sign");
+			const imageUrl = `${origin}${await signPublicImageUrl(env, source.id, 600)}`;
+			const gen = await (env.AI as { run: (m: string, input: unknown) => Promise<unknown> }).run(
+				"pruna/p-image-edit",
+				{
+					prompt: `${prompt}. Keep the rest of the photograph exactly unchanged.`,
+					images: [imageUrl],
+					aspect_ratio: source.widthPx && source.heightPx
+						? `${source.widthPx}:${source.heightPx}`
+						: "1:1",
+				},
+			);
+			if (gen && typeof gen === "object" && "image" in (gen as object)) {
+				const b64img = (gen as { image: string }).image;
+				if (b64img) {
+					const bin = atob(b64img);
+					const buf = new Uint8Array(bin.length);
+					for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+					return storeOperationResult(env, {
+						userId,
+						albumId: source.albumId,
+						source,
+						operation: "edit",
+						label: `AI edit: ${prompt.slice(0, 40)}`,
+						prompt,
+						result: { data: buf.buffer as ArrayBuffer, mime: "image/png", width: source.widthPx || 1024, height: source.heightPx || 1024 },
+					});
+				}
+			}
+		} catch {
+			// Pruna unavailable — fall through to SDXL multipart
+		}
+	}
+
 	const gen = await provider.inpaint(
 		bytes,
 		mime,

@@ -79,6 +79,7 @@ export interface AiJobMessage {
 		bbox: { x: number; y: number; w: number; h: number };
 	}>;
 	label?: string;
+	origin?: string;
 }
 
 /** Queue consumer: dispatches AI operations and settles their job rows. */
@@ -121,8 +122,14 @@ export async function handleQueue(
 					msg.mode ?? "balanced",
 				);
 			} else if (msg.type === "inpaint" && msg.prompt) {
-				// Whole-photo instruction edit (no region): FLUX edit, full frame.
-				result = await runWholePhotoEdit(env, msg.userId, image, msg.prompt);
+				// Whole-photo instruction edit (no region): Pruna edit, full frame.
+				result = await runWholePhotoEdit(
+					env,
+					msg.userId,
+					image,
+					msg.prompt,
+					(msg as { origin?: string }).origin,
+				);
 			} else if (msg.type === "batch_edit" && msg.instructions?.length) {
 				result = await runBatchEditJob(
 					env,

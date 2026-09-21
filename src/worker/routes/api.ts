@@ -532,11 +532,12 @@ api.post("/images/:id/edit", async (c) => {
 		return c.json({ error: "rate_limited" }, 429);
 	}
 	const db = createDb(c.env.DB);
+	const origin = new URL(c.req.url).origin;
 	const jobId = await createJob(db, {
 		type: "inpaint",
 		userId: user.id,
 		imageId: row.image.id,
-		payload: { prompt: body.prompt },
+		payload: { prompt: body.prompt, origin },
 	});
 	const { chargeCredits } = await import("../lib/jobs");
 	const charge = await chargeCredits(db, user.id, 2, "inpaint", jobId);
@@ -550,6 +551,7 @@ api.post("/images/:id/edit", async (c) => {
 		userId: user.id,
 		imageId: row.image.id,
 		prompt: body.prompt.slice(0, 500),
+		origin,
 	});
 	return c.json({ jobId }, 202);
 });
@@ -1382,50 +1384,18 @@ api.get("/segments/:id/crop", async (c) => {
 	return res ?? c.json({ error: "not_found" }, 404);
 });
 
-// TEMPORARY probe: bisect the edit chain (klein multipart / SDXL / SD-inpaint). Remove after.
-
-// TEMPORARY probe: Pruna P-Image shapes. Remove after verification.
-api.post("/ai-debug/pruna", async (c) => {
-	await requireUser(c);
-	const body = await c.req.json<{ imageB64: string }>().catch(() => null);
-	if (!body?.imageB64) return c.json({ error: "imageB64 required" }, 400);
-	const b64 = body.imageB64.replace(/^data:[^,]+,/, "");
-	const ai = c.env.AI as unknown as { run: (m: string, input: unknown) => Promise<unknown> };
-	const results: Record<string, unknown> = {};
-
-	// SDXL-lightning multipart img2img B&W test — full result returned for
-	// visual verification (composition preservation check).
-	try {
-		const form = new FormData();
-		form.append("prompt", "convert this photo to dramatic black and white film");
-		form.append("image", b64);
-		form.append("strength", "0.55");
-		form.append("num_steps", "6");
-		form.append("guidance", "3");
-		form.append("width", "1024");
-		form.append("height", "1024");
-		const probeReq = new Request("https://x.local", { method: "POST", body: form });
-		const out = await ai.run("@cf/bytedance/stable-diffusion-xl-lightning", {
-			multipart: { body: probeReq.body, contentType: probeReq.headers.get("content-type") || "multipart/form-data" },
-		});
-		let b64Out: string;
-		if (out instanceof ReadableStream) {
-			const buf = await new Response(out).arrayBuffer();
-			const bytes = new Uint8Array(buf);
-			let bin = "";
-			for (let i = 0; i < bytes.length; i += 0x8000) {
-				bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-			}
-			b64Out = btoa(bin);
-		} else if (out && typeof out === "object" && "image" in (out as object)) {
-			b64Out = (out as { image: string }).image;
-		} else {
-			b64Out = "UNEXPECTED: " + JSON.stringify(out).slice(0, 200);
-		}
-		results.sdxlBw = b64Out.slice(0, 60) + "…len=" + b64Out.length;
-		results.imageB64Out = b64Out;
-	} catch (e) {
-		results.sdxlBw = "ERR: " + (e instanceof Error ? e.message.slice(0, 220) : String(e));
-	}
-	return c.json({ results, imageB64Out: results.imageB64Out ?? null });
+// Signed public image URL — lets external services (Pruna P-Image family)
+// fetch a photo without exposing the album.
+api.get("/pub/img/:token", async (c) => {
+	const { verifyPublicImageUrl } = await import("../lib/sign");
+	const imageId = await verifyPublicImageUrl(c.env, c.req.param("token"));
+	if (!imageId) return c.json({ error: "invalid_or_expired" }, 404);
+	const db = createDb(c.env.DB);
+	const [image] = await db.select().from(images).where(eq(images.id, imageId)).limit(1);
+	if (!image) return c.json({ error: "not_found" }, 404);
+	const key = image.currentVersionId
+		? ((await db.select().from(imageVersions).where(eq(imageVersions.id, image.currentVersionId)).limit(1))[0]?.r2KeyFull ?? image.r2KeyOriginal)
+		: image.r2KeyOriginal;
+	const res = await getObject(c.env.MEDIA, key);
+	return res ?? c.json({ error: "not_found" }, 404);
 });
