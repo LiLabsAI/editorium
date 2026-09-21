@@ -1331,5 +1331,3 @@ api.get("/segments/:id/crop", async (c) => {
 		(await getObject(c.env.MEDIA, keys.thumb));
 	return res ?? c.json({ error: "not_found" }, 404);
 });
-
-

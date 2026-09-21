@@ -72,11 +72,11 @@
 		"AUTH_SECRET": "dev-only-insecure-set-via-wrangler-secret-in-prod",
 		"MODEL_DETECT": "@cf/facebook/detr-resnet-50",
 		"MODEL_VLM": "@cf/meta/llama-3.2-11b-vision-instruct",
-		"MODEL_VLM_SECONDARY": "@cf/google/gemma-4-26b-a4b-it",
+		"MODEL_VLM_SECONDARY": "@cf/zai-org/glm-5.3-flash",
 		"MODEL_EDIT": "@cf/black-forest-labs/flux-2-klein-9b",
 		"MODEL_T2I": "@cf/black-forest-labs/flux-1-schnell",
 		"MODEL_INPAINT": "@cf/runwayml/stable-diffusion-v1-5-inpainting",
 		"MODEL_IMG2IMG": "@cf/bytedance/stable-diffusion-xl-lightning",
-		"MODEL_LLM": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+		"MODEL_LLM": "@cf/zai-org/glm-5.3-flash"
 	}
 }

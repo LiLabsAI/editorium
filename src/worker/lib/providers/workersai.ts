@@ -70,7 +70,9 @@ export class WorkersAIProvider implements AIProvider {
 		return null;
 	}
 
-	/** Secondary VLM (gemma) with automatic fallback to the primary VLM. */
+	/** Vision ask: tries each VLM in the chain (GLM first, then llama-vision)
+	 * with both the multimodal content-parts and flat-prompt input shapes,
+	 * parsing OpenAI choices[] and Workers AI response fields. */
 	private async vlmAsk(
 		prompt: string,
 		image: ArrayBuffer,
@@ -80,16 +82,38 @@ export class WorkersAIProvider implements AIProvider {
 		const dataUrl = await this.toDataUrl(image, mime);
 		const models = [this.models.vlmSecondary, this.models.vlm].filter(Boolean);
 		for (const model of models) {
-			try {
-				const out = (await this.ai.run(model!, {
-					prompt,
-					image: dataUrl,
-					max_tokens: maxTokens,
-				})) as { response?: string; description?: string };
-				const text = out?.response ?? out?.description ?? "";
-				if (text.trim()) return text;
-			} catch {
-				// try the next VLM in the chain
+			const attempts: Array<Record<string, unknown>> = [
+				{
+					messages: [
+						{
+							role: "user",
+							content: [
+								{ type: "text", text: prompt },
+								{ type: "image_url", image_url: { url: dataUrl } },
+							],
+						},
+					],
+					max_tokens: Math.max(maxTokens, 1500),
+				},
+				{ prompt, image: dataUrl, max_tokens: Math.max(maxTokens, 1500) },
+			];
+			for (const input of attempts) {
+				try {
+					const run = this.ai as { run: (m: string, input: unknown) => Promise<unknown> };
+					const out = (await run.run(model!, input)) as {
+						response?: string;
+						description?: string;
+						choices?: Array<{ message?: { content?: string } }>;
+					};
+					const text =
+						out.response?.trim() ||
+						out.description?.trim() ||
+						out.choices?.[0]?.message?.content?.trim() ||
+						"";
+					if (text) return text;
+				} catch {
+					// try the next input shape / model
+				}
 			}
 		}
 		return null;
@@ -185,9 +209,10 @@ export class WorkersAIProvider implements AIProvider {
 				prompt:
 					'Is there a person in this photo? If yes, reply ONLY with JSON {"present":true,"box":[left,top,width,height]} where the box is percentages (0-100) of the image covering the whole person. If no person, reply {"present":false}.',
 				image: dataUrl,
-				max_tokens: 120,
-			})) as { response?: string };
-			const json = /\{[\s\S]*\}/.exec(out?.response ?? "")?.[0];
+				max_tokens: 1500,
+			})) as { response?: string; choices?: Array<{ message?: { content?: string } }> };
+			const raw = out?.response ?? out?.choices?.[0]?.message?.content ?? "";
+			const json = /\{[\s\S]*\}/.exec(raw)?.[0];
 			if (!json) return null;
 			const parsed = JSON.parse(json) as { present?: boolean; box?: number[] };
 			if (!parsed.present || !Array.isArray(parsed.box) || parsed.box.length !== 4) return null;
@@ -381,39 +406,44 @@ export class WorkersAIProvider implements AIProvider {
 				{
 					role: "system",
 					content:
-						"Rewrite the user's request as one vivid image-generation prompt: subject, then attributes, then placement, then style. No preamble.",
+						"Rewrite the user's request as one vivid image-generation prompt: subject, then attributes, then placement, then style. Reply with the prompt only.",
 				},
 				{ role: "user", content: `Operation: ${operation}\nContext: ${context}\nRequest: ${text}` },
 			],
-			max_tokens: 160,
-		})) as { response?: string };
-		return result.response?.trim() || text;
+			max_tokens: 2000,
+		})) as { response?: string; choices?: Array<{ message?: { content?: string } }> };
+		const out =
+			result.response?.trim() || result.choices?.[0]?.message?.content?.trim() || "";
+		return out || text;
 	}
 
 	async streamChat(
 		messages: Array<{ role: string; content: string }>,
 	): Promise<ReadableStream<string>> {
-		const result = await this.ai.run(this.models.llm, {
-			messages,
-			max_tokens: 500,
-			stream: true,
-		});
+		const result = await (this.ai as { run: (m: string, input: unknown) => Promise<unknown> }).run(
+			this.models.llm,
+			{ messages, max_tokens: 3000, stream: true },
+		);
 		const source = result as unknown as ReadableStream<Uint8Array>;
 		return source.pipeThrough(
 			new TransformStream<Uint8Array, string>({
 				transform(chunk, controller) {
 					const text = new TextDecoder().decode(chunk);
 					for (const line of text.split("\n")) {
-						if (line.startsWith("data:")) {
-							const payload = line.slice(5).trim();
-							if (payload && payload !== "[DONE]") {
-								try {
-									const evt = JSON.parse(payload);
-									if (evt.response) controller.enqueue(evt.response as string);
-								} catch {
-									// partial SSE frame; the next chunk completes it
-								}
-							}
+						if (!line.startsWith("data:")) continue;
+						const payload = line.slice(5).trim();
+						if (!payload || payload === "[DONE]") continue;
+						try {
+							const evt = JSON.parse(payload);
+							// OpenAI-style (GLM): choices[0].delta.content; Workers AI style: response
+							const delta =
+								evt.choices?.[0]?.delta?.content ??
+								evt.choices?.[0]?.message?.content ??
+								evt.response ??
+								"";
+							if (delta) controller.enqueue(delta as string);
+						} catch {
+							// partial SSE frame; the next chunk completes it
 						}
 					}
 				},
