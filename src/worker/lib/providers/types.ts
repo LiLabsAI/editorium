@@ -26,8 +26,6 @@ export interface GeneratedImage {
 	height: number;
 }
 
-export type ReferenceMode = "literal" | "balanced" | "creative";
-
 export interface AIProvider {
 	/** Detect salient objects: boxes + class labels. */
 	detect(image: ArrayBuffer, mime: string): Promise<DetectedBox[]>;
@@ -67,30 +65,17 @@ export interface AIProvider {
 		opts: { aspect?: string },
 	): Promise<GeneratedImage>;
 
-	/** Image-to-image edit constrained by strength (reference mode). */
-	imageToImage(
-		image: ArrayBuffer,
-		mime: string,
+	/**
+	 * Edit guided by a reference photo (phase 4). The reference must already
+	 * be downscaled to fit REFERENCE_MAX_PX (FLUX.2's input limit); the
+	 * provider MUST condition on it — never fall back to text-only generation.
+	 * `dims` is the aspect-preserving output size (see editDims).
+	 */
+	editWithReference(
+		reference: { bytes: ArrayBuffer; mime: string },
 		prompt: string,
-		strength: number,
-	): Promise<GeneratedImage>;
-
-	/** Inpaint a masked region of the image from a prompt. */
-	inpaint(
-		image: ArrayBuffer,
-		mime: string,
-		mask: ArrayBuffer | null,
-		box: { x: number; y: number; w: number; h: number },
-		prompt: string,
-		dims?: { width: number; height: number },
-	): Promise<GeneratedImage>;
-
-	/** Upscale + detail enhance ("4k professional camera" flow). */
-	upscale(
-		image: ArrayBuffer,
-		mime: string,
-		factor: number,
-	): Promise<GeneratedImage>;
+		dims: { width: number; height: number },
+	): Promise<GeneratedImage & { model: string }>;
 
 	/** Rewrite casual user text into a structured generation prompt. */
 	rewritePrompt(
@@ -103,16 +88,54 @@ export interface AIProvider {
 	streamChat(
 		messages: Array<{ role: string; content: string }>,
 	): Promise<ReadableStream<string>>;
-
-	/** Best-effort safety check for uploads. Returns violation label or null. */
-	moderateImage(image: ArrayBuffer, mime: string): Promise<string | null>;
 }
 
-export const MODE_STRENGTH: Record<ReferenceMode, number> = {
-	literal: 0.85,
-	balanced: 0.6,
-	creative: 0.35,
-};
+/**
+ * Output size for image-edit models: preserve the source aspect ratio, fit the
+ * longest side to `maxSide`, round to multiples of 16 (diffusion latents),
+ * clamp each side to [256, maxSide]. The old code clamped width and height
+ * independently, turning every large photo into a 1024x1024 square.
+ */
+export function editDims(
+	width: number,
+	height: number,
+	maxSide = 1024,
+): { width: number; height: number } {
+	const w = width > 0 ? width : maxSide;
+	const h = height > 0 ? height : maxSide;
+	const scale = maxSide / Math.max(w, h);
+	const snap = (n: number) => Math.min(maxSide, Math.max(256, Math.round((n * scale) / 16) * 16));
+	return { width: snap(w), height: snap(h) };
+}
+
+/** FLUX.2 reference images must be smaller than 512×512 (Workers AI docs). */
+export const REFERENCE_MAX_PX = 511;
+
+/** Reference size: fit inside REFERENCE_MAX_PX, aspect preserved. */
+export function referenceDims(width: number, height: number): { width: number; height: number } {
+	const scale = Math.min(1, REFERENCE_MAX_PX / Math.max(width, height));
+	return { width: Math.max(1, Math.floor(width * scale)), height: Math.max(1, Math.floor(height * scale)) };
+}
+
+/** Pruna P-Image-Edit only accepts these ratios; pick the closest. */
+export const PRUNA_ASPECTS = ["1:1", "16:9", "9:16", "4:3", "3:4"] as const;
+
+export function closestAspect(width: number, height: number): (typeof PRUNA_ASPECTS)[number] {
+	if (!(width > 0 && height > 0)) return "1:1";
+	const target = Math.log(width / height);
+	let best: (typeof PRUNA_ASPECTS)[number] = "1:1";
+	let bestDiff = Infinity;
+	for (const aspect of PRUNA_ASPECTS) {
+		const [a, b] = aspect.split(":").map(Number) as [number, number];
+		const diff = Math.abs(Math.log(a / b) - target);
+		if (diff < bestDiff) {
+			bestDiff = diff;
+			best = aspect;
+		}
+	}
+	return best;
+}
+
 
 export class ProviderError extends Error {
 	constructor(

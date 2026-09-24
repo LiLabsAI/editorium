@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router";
 
-import { api, fileUrl, type ImageDto } from "../lib/api";
+import { api, describeError, fileUrl, waitForJob, type ImageDto, type VersionDto } from "../lib/api";
 import { editorStore } from "../lib/store";
 import { TopBar } from "../components/TopBar";
 import { AskComposer } from "../components/Composer";
@@ -16,18 +16,20 @@ export function EditorPage({ projectName }: { projectName: string }) {
 	const [image, setImage] = useState<ImageDto | null>(null);
 	const [family, setFamily] = useState<ImageDto[]>([]);
 	const [applying, setApplying] = useState<string | null>(null);
+	const [notice, setNotice] = useState<string | null>(null);
 
 	// Fresh state per photo (the old editor leaked zoom/selection across routes).
 	useEffect(() => {
 		editorStore.set({ tool: "region", selectedIds: [], hoveredId: null });
 	}, [imageId]);
 
-	const [versions, setVersions] = useState<Array<{ id: string; label: string; parentVersionId: string | null }>>([]);
+	const [versions, setVersions] = useState<VersionDto[]>([]);
 
 	const loadAll = useCallback(async () => {
 		if (!albumId || !imageId) return;
-		const { image: img, versions: vers } = await api.image(imageId);
+		const { image: img, album, versions: vers } = await api.image(imageId);
 		setImage(img);
+		setAlbumTitle(album.title);
 		setVersions(vers);
 		try {
 			const f = await api.branchFamily(imageId);
@@ -35,58 +37,67 @@ export function EditorPage({ projectName }: { projectName: string }) {
 		} catch {
 			setFamily([]);
 		}
-		const r = await api.albums();
-		setAlbumTitle(r.albums.find((a) => a.id === albumId)?.title ?? "Album");
 	}, [albumId, imageId]);
 
 	useEffect(() => {
-		loadAll();
+		loadAll().catch((err) => setNotice(describeError(err)));
 	}, [loadAll]);
 
 	async function download() {
 		if (!image) return;
-		const res = await fetch(fileUrl(image.id, "original"));
+		const res = await fetch(fileUrl(image.id, "original", image.currentVersionId ?? undefined));
+		if (!res.ok) {
+			setNotice("Download failed. Please try again.");
+			return;
+		}
 		const blob = await res.blob();
+		const ext = blob.type.split("/")[1]?.replace("jpeg", "jpg") ?? "png";
 		const a = document.createElement("a");
 		a.href = URL.createObjectURL(blob);
-		a.download = image.filenameLabel || "editorium";
+		a.download = `${image.filenameLabel.replace(/\.[a-z0-9]+$/i, "") || "editorium"}.${ext}`;
 		a.click();
 		URL.revokeObjectURL(a.href);
 	}
 
 	async function share() {
 		if (!image) return;
-		const { url } = await api.share(image.id);
-		const full = `${location.origin}${url}`;
-		await navigator.clipboard?.writeText(full).catch(() => undefined);
-		alert(`Share link copied:\n${full}`);
+		try {
+			const { url } = await api.share(image.id);
+			const full = `${location.origin}${url}`;
+			const copied = await navigator.clipboard?.writeText(full).then(
+				() => true,
+				() => false,
+			);
+			setNotice(copied ? `Share link copied: ${full}` : `Share link: ${full}`);
+		} catch (err) {
+			setNotice(`Couldn't create a share link: ${describeError(err)}`);
+		}
+	}
+
+	/** Follow a job to its branched photo; report failure or a slow job. */
+	async function followJob(jobId: string, what: string) {
+		const job = await waitForJob(jobId);
+		if (!job) {
+			setNotice(`${what} is taking longer than usual — the new photo will appear in the strip when it's done.`);
+		} else if (job.status === "error") {
+			setNotice(`${what} failed. Your credits were refunded.`);
+		} else if (job.resultImageId) {
+			navigate(`/albums/${albumId}/images/${job.resultImageId}`);
+		}
 	}
 
 	/** Region edit: draw a rect, describe the change, apply to that region. */
 	async function regionEdit(rect: { x: number; y: number; w: number; h: number }, text: string) {
 		if (!image || !albumId || applying) return;
 		setApplying("Applying region edit…");
+		setNotice(null);
 		try {
-			await api.createInstruction(image.id, { text, bbox: rect });
-			const { jobId } = await api.applyInstructions(image.id);
-			for (let i = 0; i < 60; i++) {
-				const { job } = await api.job(jobId);
-				if (job.status === "done") {
-					if (job.resultImageId) {
-						navigate(`/albums/${albumId}/images/${job.resultImageId}`);
-					}
-					break;
-				}
-				if (job.status === "error") {
-					setApplying("Edit failed: " + (job.error ?? "unknown error"));
-					await new Promise((r) => setTimeout(r, 4000));
-					break;
-				}
-				await new Promise((r) => setTimeout(r, 1500));
-			}
+			const { instruction } = await api.createInstruction(image.id, { text, bbox: rect });
+			// Apply only THIS chip, never stale ones from an earlier attempt.
+			const { jobId } = await api.applyInstructions(image.id, [instruction.id]);
+			await followJob(jobId, "The region edit");
 		} catch (err) {
-			setApplying("Edit failed: " + (err instanceof Error ? err.message : String(err)));
-			await new Promise((r) => setTimeout(r, 4000));
+			setNotice(`Edit failed: ${describeError(err)}`);
 		}
 		setApplying(null);
 	}
@@ -97,6 +108,7 @@ export function EditorPage({ projectName }: { projectName: string }) {
 	async function applyFilter(kind: "bw" | "golden", label: string) {
 		if (!image || !albumId || applying) return;
 		setApplying(label + "…");
+		setNotice(null);
 		try {
 			const img = new Image();
 			img.crossOrigin = "anonymous";
@@ -105,12 +117,15 @@ export function EditorPage({ projectName }: { projectName: string }) {
 				img.onload = res;
 				img.onerror = () => rej(new Error("Could not load photo"));
 			});
+			// Cap at ~24 MP so huge photos neither exhaust memory nor exceed
+			// the 25 MB upload limit once re-encoded.
+			const scale = Math.min(1, Math.sqrt(24_000_000 / (img.naturalWidth * img.naturalHeight)));
 			const canvas = document.createElement("canvas");
-			canvas.width = img.naturalWidth;
-			canvas.height = img.naturalHeight;
+			canvas.width = Math.round(img.naturalWidth * scale);
+			canvas.height = Math.round(img.naturalHeight * scale);
 			const ctx = canvas.getContext("2d");
 			if (!ctx) throw new Error("Canvas unavailable");
-			ctx.drawImage(img, 0, 0);
+			ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 			const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
 			const px = data.data;
 			for (let i = 0; i < px.length; i += 4) {
@@ -127,44 +142,40 @@ export function EditorPage({ projectName }: { projectName: string }) {
 			}
 			ctx.putImageData(data, 0, 0);
 			const blob = await new Promise<Blob>((res, rej) =>
-				canvas.toBlob((b) => (b ? res(b) : rej(new Error("toBlob failed"))), "image/png"),
+				canvas.toBlob((b) => (b ? res(b) : rej(new Error("toBlob failed"))), "image/jpeg", 0.92),
 			);
 			const { imageId: newId } = await api.filterBranch(image.id, label, blob);
 			navigate(`/albums/${albumId}/images/${newId}`);
 		} catch (err) {
-			setApplying("Filter failed: " + (err instanceof Error ? err.message : String(err)));
-			await new Promise((r) => setTimeout(r, 4000));
+			setNotice(`${label} failed: ${describeError(err)}`);
 		}
 		setApplying(null);
 	}
 
-	/** The core loop: words → whole-photo edit → branched photo. */
-	async function sendEdit(text: string) {
+	/** Run one queued operation and follow it to the new photo. */
+	async function runOperation(status: string, what: string, start: () => Promise<{ jobId: string }>) {
 		if (!image || !albumId || applying) return;
-		setApplying("Editing your photo…");
+		setApplying(status);
+		setNotice(null);
 		try {
-			const { jobId } = await api.editImage(image.id, text);
-			for (let i = 0; i < 60; i++) {
-				const { job } = await api.job(jobId);
-				if (job.status === "done") {
-					if (job.resultImageId) {
-						navigate(`/albums/${albumId}/images/${job.resultImageId}`);
-					}
-					break;
-				}
-				if (job.status === "error") {
-					setApplying("Edit failed: " + (job.error ?? "unknown error"));
-					await new Promise((r) => setTimeout(r, 4000));
-					break;
-				}
-				await new Promise((r) => setTimeout(r, 1500));
-			}
+			const { jobId } = await start();
+			await followJob(jobId, what);
 		} catch (err) {
-			setApplying("Edit failed: " + (err instanceof Error ? err.message : String(err)));
-			await new Promise((r) => setTimeout(r, 4000));
+			setNotice(`${what} failed: ${describeError(err)}`);
 		}
 		setApplying(null);
 	}
+
+	/** Free-text change → Reimagine (whole-photo AI edit, may alter details). */
+	const sendEdit = (text: string) =>
+		runOperation("Reimagining your photo…", "The edit", () => api.editImage(image!.id, text));
+	/** ESRGAN upscale + sharpen: same photo, more detail. */
+	const enhance = () => runOperation("Enhancing…", "Enhance", () => api.enhanceImage(image!.id));
+	/** Segmentation: subject kept pixel-for-pixel, background removed. */
+	const removeBackground = () =>
+		runOperation("Removing background…", "Background removal", () => api.removeBackground(image!.id));
+
+	const currentVersion = versions.find((v) => v.id === image?.currentVersionId) ?? versions[versions.length - 1];
 
 	return (
 		<div className="flex h-screen flex-col">
@@ -235,8 +246,24 @@ export function EditorPage({ projectName }: { projectName: string }) {
 						<h2 className="text-sm font-semibold">Edit with words</h2>
 					</div>
 					<div className="min-h-0 flex-1 overflow-y-auto px-4 text-sm leading-relaxed text-muted-foreground">
-						<p>Describe any change and press send — you'll get a new photo beside the original. The original never changes.</p>
-						<p className="mt-3 text-xs">Try: “make the wall white” · “turn the jacket into a denim jacket” · “make it look like golden hour”</p>
+						<p>Every result is a new photo beside the original. The original never changes.</p>
+						<ul className="mt-3 space-y-1.5 text-xs">
+							<li>
+								<span className="text-foreground">Drag a box</span> on the photo to change just that area — everything outside it stays pixel-for-pixel.
+							</li>
+							<li>
+								<span className="text-foreground">Enhance</span> and <span className="text-foreground">Remove background</span> keep the photo as it is.
+							</li>
+							<li>
+								<span className="text-foreground">Describe a change</span> below to reimagine the whole photo — AI may alter other details.
+							</li>
+						</ul>
+						{currentVersion?.opClass && (
+							<p className="mt-4 rounded-lg bg-secondary/60 px-3 py-2 text-xs" title={currentVersion.model ?? undefined}>
+								This photo: {OP_CLASS_LABEL[currentVersion.opClass] ?? currentVersion.opClass}
+								{currentVersion.fidelity !== null && ` · fidelity ${currentVersion.fidelity.toFixed(2)}`}
+							</p>
+						)}
 					</div>
 					<div className="space-y-2 p-4 pt-0">
 						<div className="flex flex-wrap gap-1.5">
@@ -256,17 +283,19 @@ export function EditorPage({ projectName }: { projectName: string }) {
 							</button>
 							<button
 								disabled={applying !== null}
-								onClick={() => sendEdit("enhance this photo: increase sharpness, clarity and detail, professional camera quality")}
+								onClick={enhance}
+								title="AI upscale + sharpen. Keeps the photo exactly as it is."
 								className="rounded-full border ed-hairline bg-secondary px-3 py-1.5 text-xs transition hover:bg-muted disabled:opacity-40"
 							>
 								✦ Enhance (AI)
 							</button>
 							<button
 								disabled={applying !== null}
-								onClick={() => sendEdit("remove the background completely, replace it with a clean white studio backdrop, keep the subject unchanged")}
+								onClick={removeBackground}
+								title="Cuts out the subject onto a transparent background. Nothing is repainted."
 								className="rounded-full border ed-hairline bg-secondary px-3 py-1.5 text-xs transition hover:bg-muted disabled:opacity-40"
 							>
-								Remove background (AI)
+								Remove background
 							</button>
 						</div>
 						{versions.length > 1 && (
@@ -275,8 +304,12 @@ export function EditorPage({ projectName }: { projectName: string }) {
 								value={image?.currentVersionId ?? ""}
 								onChange={async (e) => {
 									if (!image) return;
-									await api.activateVersion(image.id, e.target.value);
-									loadAll();
+									try {
+										await api.activateVersion(image.id, e.target.value);
+										await loadAll();
+									} catch (err) {
+										setNotice(describeError(err));
+									}
 								}}
 								className="w-full rounded-lg border ed-hairline bg-background px-2 py-1.5 text-xs"
 							>
@@ -287,16 +320,30 @@ export function EditorPage({ projectName }: { projectName: string }) {
 								))}
 							</select>
 						)}
+						{notice && (
+							<p role="alert" className="break-words rounded-lg bg-secondary/60 px-3 py-2 text-xs text-foreground">
+								{notice}
+							</p>
+						)}
 						{applying && (
 							<div className="flex items-center gap-2 rounded-lg bg-secondary/60 px-3 py-2 text-xs text-foreground" role="status">
 								<span className="size-3 animate-spin rounded-full border-2 border-white/20 border-t-white/80" />
 								{applying}
 							</div>
 						)}
-						<AskComposer onSend={sendEdit} disabled={applying !== null} placeholder="Describe a change…" />
+						<AskComposer onSend={sendEdit} disabled={applying !== null} placeholder="Reimagine: describe a change…" />
 					</div>
 				</aside>
 			</div>
 		</div>
 	);
 }
+
+const OP_CLASS_LABEL: Record<string, string> = {
+	adjust: "adjusted (no AI)",
+	enhance: "AI-enhanced (same content)",
+	segment: "background removed (subject untouched)",
+	local: "region edited (outside unchanged)",
+	reimagine: "reimagined by AI",
+	generate: "generated by AI",
+};

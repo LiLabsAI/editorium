@@ -1,7 +1,7 @@
 {
 	"name": "editorium",
 	"version": "0.1.0",
-	"description": "A reusable React, Hono, Drizzle ORM, D1, and Cloudflare Workers application foundation",
+	"description": "Editorium \u2014 an AI photo editor on Cloudflare Workers",
 	"private": true,
 	"packageManager": "pnpm@11.5.0",
 	"engines": {
@@ -40,6 +40,7 @@
 		"@types/react-dom": "19.2.3",
 		"@vitejs/plugin-react": "5.1.1",
 		"drizzle-kit": "0.31.10",
+		"esbuild": "0.25.12",
 		"eslint": "9.39.2",
 		"eslint-plugin-react-hooks": "7.0.1",
 		"eslint-plugin-react-refresh": "0.4.24",
@@ -66,7 +67,8 @@
 		"test": "pnpm run test:app && pnpm run test:worker",
 		"test:app": "vitest run --config vitest.app.config.ts",
 		"test:worker": "vitest run --config vitest.worker.config.ts",
-		"typecheck": "tsc -b"
+		"typecheck": "tsc -b",
+		"probe:models": "esbuild scripts/probe-models.ts --bundle --platform=node --format=esm --packages=external --tsconfig-raw={} --outfile=.probe/probe-models.mjs --log-level=warning && node .probe/probe-models.mjs"
 	},
 	"type": "module"
 }

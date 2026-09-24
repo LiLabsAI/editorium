@@ -5,12 +5,12 @@ import type { AIProvider } from "./types";
 export * from "./types";
 
 /**
- * Pick the provider for this environment. AI_MOCK=true (the default var)
- * keeps everything offline and deterministic; set it to "false" to route to
- * Workers AI using the MODEL_* vars from wrangler.json.
+ * Pick the provider for this environment. Production (wrangler.json) sets
+ * AI_MOCK="false" and routes to Workers AI using the MODEL_* vars; tests set
+ * AI_MOCK="true" for the offline, deterministic mock.
  */
 export function getProvider(env: Env): AIProvider {
-	if ((env.AI_MOCK ?? "true").toLowerCase() === "true") {
+	if (isMock(env)) {
 		return new MockProvider();
 	}
 	return new WorkersAIProvider(env.AI, {
@@ -19,7 +19,10 @@ export function getProvider(env: Env): AIProvider {
 		vlmSecondary: env.MODEL_VLM_SECONDARY,
 		t2i: env.MODEL_T2I,
 		llm: env.MODEL_LLM,
-		img2img: env.MODEL_IMG2IMG,
 		edit: env.MODEL_EDIT,
 	});
+}
+
+export function isMock(env: Env): boolean {
+	return String(env.AI_MOCK ?? "true").toLowerCase() === "true";
 }

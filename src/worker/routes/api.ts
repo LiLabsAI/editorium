@@ -1,10 +1,14 @@
-import { and, desc, eq, isNull, like, or, sql } from "drizzle-orm";
-import { Hono } from "hono";
+import { and, asc, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
+import { Hono, type Context } from "hono";
+import { z } from "zod";
 
 import {
 	albums,
 	chatMessages,
 	chatThreads,
+	creditEvents,
+	editInstructions,
+	imageAnnotations,
 	imagePalettes,
 	imageVersions,
 	images,
@@ -15,57 +19,158 @@ import {
 	segmentPrompts,
 	segments,
 	shareLinks,
-	imageAnnotations,
-	editInstructions,
+	type ImageRow,
+	type ImageVersion,
 } from "../../../database/schema";
+import { streamAgentResponse } from "../agent";
 import { ensureProject, getUser, requireUser } from "../lib/auth";
+import { MAX_CHAT_CHARS, MAX_POLYGON_POINTS, MAX_PROMPT_CHARS, MAX_UPLOAD_BYTES } from "../lib/config";
 import { createDb } from "../lib/db";
-import { createJob, enqueueJob } from "../lib/jobs";
-import { getProvider } from "../lib/providers";
-import { deriveVariants } from "../lib/operations";
+import { bboxSchema, fail, readJson, unit } from "../lib/http";
+import { chargeCredits, createJob, CREDIT_COSTS, enqueueJob, type JobType } from "../lib/jobs";
+import { allow, requireAiQuota } from "../lib/limits";
+import { buildPolygonMask } from "../lib/mask";
 import {
-	extForMime,
-	getObject,
-	imageDimensions,
-	mediaKeys,
-	putObject,
-	sniffMime,
-	validateImageMime,
-} from "../lib/r2";
+	createImageFromBytes,
+	deleteImageMedia,
+	deriveVariants,
+	loadImageBytes,
+	logWarn,
+} from "../lib/operations";
+import { getProvider, isMock } from "../lib/providers";
+import { albumPrefix, deletePrefix, getObject, legacyAlbumPrefix, mediaKeys, putObject, sniffMime } from "../lib/r2";
+import { verifyPublicImageUrl } from "../lib/sign";
+import type { AiJobMessage } from "../queue";
+import { auth } from "./auth";
+
+type Ctx = Context<{ Bindings: Env }>;
 
 export const api = new Hono<{ Bindings: Env }>();
 
+api.route("/auth", auth);
+api.notFound((c) => c.json({ error: "not_found" }, 404));
+
 // ---------------------------------------------------------------------------
-// Auth (demo-grade session bootstrap; swap for a real flow in production)
+// Shared helpers
 // ---------------------------------------------------------------------------
 
-api.post("/auth/demo", async (c) => {
+const hexColor = z.string().regex(/^#[0-9a-fA-F]{6}$/);
+const idSchema = z.string().min(1).max(64);
+
+/** One query: the image, its album, and proof the caller owns it. */
+async function ownedImage(env: Env, userId: string, imageId: string) {
+	const db = createDb(env.DB);
+	const [row] = await db
+		.select({ image: images, album: albums })
+		.from(images)
+		.innerJoin(albums, eq(albums.id, images.albumId))
+		.innerJoin(projects, eq(projects.id, albums.projectId))
+		.where(and(eq(images.id, imageId), eq(projects.ownerId, userId)))
+		.limit(1);
+	return row ?? null;
+}
+
+async function requireImage(c: Ctx, userId: string) {
+	const row = await ownedImage(c.env, userId, c.req.param("id") ?? "");
+	if (!row) fail(404, "not_found");
+	return row;
+}
+
+async function requireAlbum(c: Ctx, userId: string, albumId: string) {
 	const db = createDb(c.env.DB);
-	const { makeSessionToken, sessionCookie } = await import("../lib/auth");
-	const body = await c.req.json<{ name?: string }>().catch(() => ({}) as { name?: string });
-	const name = (body.name ?? "Md Ahad Ali").slice(0, 60);
-	const [existing] = await db.select().from(projects).orderBy(desc(projects.createdAt)).limit(1);
-	let userId: string;
-	if (existing) {
-		const { users } = await import("../../../database/schema");
-		const [owner] = await db.select().from(users).where(eq(users.id, existing.ownerId)).limit(1);
-		userId = owner?.id ?? crypto.randomUUID();
-		if (!owner) {
-			await db.insert(users).values({ id: userId, name });
-		}
-	} else {
-		userId = crypto.randomUUID();
-		const { users } = await import("../../../database/schema");
-		await db.insert(users).values({ id: userId, name });
+	const [row] = await db
+		.select({ album: albums })
+		.from(albums)
+		.innerJoin(projects, eq(projects.id, albums.projectId))
+		.where(and(eq(albums.id, albumId), eq(projects.ownerId, userId)))
+		.limit(1);
+	if (!row) fail(404, "not_found");
+	return row.album;
+}
+
+async function ownedSegment(env: Env, userId: string, segmentId: string) {
+	const db = createDb(env.DB);
+	const [row] = await db
+		.select({ segment: segments, albumId: albums.id })
+		.from(segments)
+		.innerJoin(images, eq(images.id, segments.imageId))
+		.innerJoin(albums, eq(albums.id, images.albumId))
+		.innerJoin(projects, eq(projects.id, albums.projectId))
+		.where(and(eq(segments.id, segmentId), eq(projects.ownerId, userId), isNull(segments.deletedAt)))
+		.limit(1);
+	return row ?? null;
+}
+
+async function currentVersion(env: Env, image: ImageRow): Promise<ImageVersion | null> {
+	if (!image.currentVersionId) return null;
+	const db = createDb(env.DB);
+	const [version] = await db
+		.select()
+		.from(imageVersions)
+		.where(eq(imageVersions.id, image.currentVersionId))
+		.limit(1);
+	return version ?? null;
+}
+
+type Variant = "web" | "thumb" | "original";
+const variantSchema = z.enum(["web", "thumb", "original"]).catch("web");
+
+/** R2 key for a variant of a specific version (falls back to image-level). */
+function variantKey(image: ImageRow, version: ImageVersion | null, variant: Variant): string {
+	const full = version?.r2KeyFull ?? image.r2KeyOriginal;
+	if (variant === "original") return full;
+	if (variant === "thumb") return version?.r2KeyThumb ?? image.r2KeyThumb ?? full;
+	return version?.r2KeyWeb ?? image.r2KeyWeb ?? full;
+}
+
+/** Run background work after the response (R2 cleanup). */
+function background(c: Ctx, work: Promise<unknown>): void {
+	const guarded = work.catch((error) => logWarn("background_task_failed", error));
+	try {
+		c.executionCtx.waitUntil(guarded);
+	} catch {
+		void guarded; // no ExecutionContext (unit tests): let it settle on its own
 	}
-	const token = await makeSessionToken(userId, c.env.AUTH_SECRET);
-	c.header("Set-Cookie", sessionCookie(token));
-	return c.json({ ok: true, userId });
-});
+}
+
+/** Create a job, charge it atomically, enqueue it. Refuses (402) without credit. */
+async function startJob(
+	c: Ctx,
+	userId: string,
+	type: Exclude<JobType, "caption" | "thumb">,
+	message: Omit<AiJobMessage, "jobId" | "type" | "userId">,
+	payload?: Record<string, unknown>,
+): Promise<string> {
+	await requireAiQuota(c.env, userId);
+	const db = createDb(c.env.DB);
+	const jobId = await createJob(db, {
+		type,
+		userId,
+		imageId: message.imageId,
+		segmentId: message.segmentId,
+		payload,
+	});
+	const charge = await chargeCredits(db, userId, CREDIT_COSTS[type], type, jobId);
+	if (!charge.ok) {
+		await db.delete(jobs).where(eq(jobs.id, jobId));
+		fail(402, "insufficient_credits");
+	}
+	const body: AiJobMessage = { ...message, jobId, type, userId };
+	await enqueueJob(c.env.AI_JOBS, jobId, type, { ...body });
+	return jobId;
+}
+
+function origin(c: Ctx): string {
+	return new URL(c.req.url).origin;
+}
+
+// ---------------------------------------------------------------------------
+// Session
+// ---------------------------------------------------------------------------
 
 api.get("/me", async (c) => {
 	const user = await getUser(c);
-	if (!user) return c.json({ user: null }, 200);
+	if (!user) return c.json({ user: null });
 	const project = await ensureProject(c, user);
 	return c.json({
 		user: { id: user.id, name: user.name, plan: user.plan, credits: user.creditBalance },
@@ -74,16 +179,15 @@ api.get("/me", async (c) => {
 });
 
 // ---------------------------------------------------------------------------
-// Projects / albums (dashboard, Screen A)
+// Albums (dashboard, Screen A)
 // ---------------------------------------------------------------------------
 
 api.get("/albums", async (c) => {
-	const user = await requireUser(c).catch(() => null);
-	if (!user) return c.json({ error: "unauthorized" }, 401);
+	const user = await requireUser(c);
 	const project = await ensureProject(c, user);
 	const db = createDb(c.env.DB);
 	const sort = c.req.query("sort") ?? "newest";
-	const q = c.req.query("q");
+	const q = (c.req.query("q") ?? "").trim().slice(0, 100).toLowerCase();
 	const rows = await db
 		.select({
 			id: albums.id,
@@ -95,73 +199,61 @@ api.get("/albums", async (c) => {
 		})
 		.from(albums)
 		.where(
+			// instr() is a literal substring match: user input can't smuggle
+			// LIKE wildcards (%/_) the way the old query allowed.
 			q
-				? and(eq(albums.projectId, project.id), like(albums.title, `%${q}%`))
+				? and(eq(albums.projectId, project.id), sql`instr(lower(${albums.title}), ${q}) > 0`)
 				: eq(albums.projectId, project.id),
+		)
+		.orderBy(
+			sort === "oldest" ? asc(albums.createdAt) : sort === "name" ? asc(albums.title) : desc(albums.createdAt),
 		);
-	const sorted = [...rows].sort((a, b) =>
-		sort === "oldest"
-			? a.createdAt.getTime() - b.createdAt.getTime()
-			: sort === "name"
-				? a.title.localeCompare(b.title)
-				: b.createdAt.getTime() - a.createdAt.getTime(),
-	);
-	return c.json({
-		project: { id: project.id, name: project.name },
-		albums: sorted,
-	});
+	return c.json({ project: { id: project.id, name: project.name }, albums: rows });
 });
 
 api.post("/albums", async (c) => {
 	const user = await requireUser(c);
 	const project = await ensureProject(c, user);
+	const body = await readJson(c, z.object({ title: z.string().max(120).optional() }));
 	const db = createDb(c.env.DB);
-	const body = await c.req.json<{ title?: string }>().catch(() => ({}) as { title?: string });
 	const [album] = await db
 		.insert(albums)
-		.values({
-			id: crypto.randomUUID(),
-			projectId: project.id,
-			title: body.title?.trim() || "Untitled album",
-		})
+		.values({ id: crypto.randomUUID(), projectId: project.id, title: body.title?.trim() || "Untitled album" })
 		.returning();
 	return c.json({ album }, 201);
 });
 
 api.get("/albums/:id", async (c) => {
 	const user = await requireUser(c);
-	const project = await ensureProject(c, user);
-	const db = createDb(c.env.DB);
-	const [album] = await db
-		.select()
-		.from(albums)
-		.where(and(eq(albums.id, c.req.param("id")), eq(albums.projectId, project.id)))
-		.limit(1);
-	if (!album) return c.json({ error: "not_found" }, 404);
-	return c.json({ album });
+	return c.json({ album: await requireAlbum(c, user.id, c.req.param("id")) });
 });
 
 api.patch("/albums/:id", async (c) => {
 	const user = await requireUser(c);
+	const album = await requireAlbum(c, user.id, c.req.param("id"));
+	const body = await readJson(c, z.object({ title: z.string().trim().min(1).max(120) }));
 	const db = createDb(c.env.DB);
-	const body = await c.req.json<{ title?: string }>();
-	const project = await ensureProject(c, user);
 	const [updated] = await db
 		.update(albums)
-		.set({ title: body.title?.slice(0, 120), updatedAt: new Date() })
-		.where(and(eq(albums.id, c.req.param("id")), eq(albums.projectId, project.id)))
+		.set({ title: body.title, updatedAt: new Date() })
+		.where(eq(albums.id, album.id))
 		.returning();
-	if (!updated) return c.json({ error: "not_found" }, 404);
 	return c.json({ album: updated });
 });
 
 api.delete("/albums/:id", async (c) => {
 	const user = await requireUser(c);
-	const project = await ensureProject(c, user);
+	const album = await requireAlbum(c, user.id, c.req.param("id"));
 	const db = createDb(c.env.DB);
-	await db
-		.delete(albums)
-		.where(and(eq(albums.id, c.req.param("id")), eq(albums.projectId, project.id)));
+	await db.delete(albums).where(eq(albums.id, album.id));
+	// Rows cascade; the R2 objects must be removed explicitly.
+	background(
+		c,
+		Promise.all([
+			deletePrefix(c.env.MEDIA, albumPrefix(user.id, album.id)),
+			deletePrefix(c.env.MEDIA, legacyAlbumPrefix(user.id, album.id)),
+		]),
+	);
 	return c.json({ ok: true });
 });
 
@@ -169,10 +261,7 @@ api.get("/references", async (c) => {
 	const user = await requireUser(c);
 	const project = await ensureProject(c, user);
 	const db = createDb(c.env.DB);
-	const rows = await db
-		.select()
-		.from(references)
-		.where(eq(references.projectId, project.id));
+	const rows = await db.select().from(references).where(eq(references.projectId, project.id));
 	return c.json({ references: rows });
 });
 
@@ -180,204 +269,108 @@ api.get("/references", async (c) => {
 // Images (upload pipeline, Screen B cards + editor)
 // ---------------------------------------------------------------------------
 
-async function ownedImage(c: { req: { param: (k: string) => string } }, env: Env, userId: string) {
-	const db = createDb(env.DB);
-	const [row] = await db
-		.select({ image: images, album: albums })
-		.from(images)
-		.innerJoin(albums, eq(albums.id, images.albumId))
-		.innerJoin(projects, eq(projects.id, albums.projectId))
-		.where(eq(images.id, c.req.param("id")))
-		.limit(1);
-	if (!row || row.album.projectId !== (await projectOf(env, userId))?.id) return null;
-	return row;
-}
-
-async function projectOf(env: Env, userId: string) {
-	const db = createDb(env.DB);
-	const [project] = await db
-		.select()
-		.from(projects)
-		.where(eq(projects.ownerId, userId))
-		.limit(1);
-	return project ?? null;
-}
-
 api.get("/albums/:id/images", async (c) => {
 	const user = await requireUser(c);
-	const db = createDb(c.env.DB);
+	const album = await requireAlbum(c, user.id, c.req.param("id"));
 	const filter = c.req.query("filter") ?? "all";
-	const conditions = [eq(albums.id, c.req.param("id")), eq(albums.projectId, (await ensureProject(c, user)).id)];
+	const db = createDb(c.env.DB);
 	const rows = await db
-		.select({ image: images, albumId: albums.id })
+		.select()
 		.from(images)
-		.innerJoin(albums, eq(albums.id, images.albumId))
-		.where(and(...conditions))
+		.where(
+			filter === "uploads"
+				? and(eq(images.albumId, album.id), eq(images.kind, "upload"))
+				: filter === "generated"
+					? and(eq(images.albumId, album.id), ne(images.kind, "upload"))
+					: eq(images.albumId, album.id),
+		)
 		.orderBy(images.positionIdx, images.createdAt);
-	const filtered = rows.filter((r) =>
-		filter === "all" ? true : filter === "uploads" ? r.image.kind === "upload" : r.image.kind !== "upload",
-	);
-	return c.json({ images: filtered.map((r) => r.image) });
+	return c.json({ images: rows });
 });
 
 api.get("/images/:id", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
+	const row = await requireImage(c, user.id);
 	const db = createDb(c.env.DB);
 	const versions = await db
 		.select()
 		.from(imageVersions)
 		.where(eq(imageVersions.imageId, row.image.id))
 		.orderBy(imageVersions.createdAt);
-	return c.json({ image: row.image, versions });
+	return c.json({ image: row.image, album: { id: row.album.id, title: row.album.title }, versions });
 });
 
 api.get("/images/:id/file", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
-	const variant = c.req.query("variant") ?? "web";
-	const versionParam = c.req.query("v");
-	const keys = mediaKeys(user.id, row.album.id, row.image.id);
-	const db = createDb(c.env.DB);
-	let key: string;
-	if (versionParam) {
-		// Version-scoped serving (plan 18): web/thumb fall back to the version
-		// full object when derivatives are missing.
-		const [version] = await db
+	const row = await requireImage(c, user.id);
+	const variant = variantSchema.parse(c.req.query("variant"));
+	const versionId = c.req.query("v");
+	let version: ImageVersion | null;
+	if (versionId) {
+		const db = createDb(c.env.DB);
+		[version = null] = await db
 			.select()
 			.from(imageVersions)
-			.where(and(eq(imageVersions.id, versionParam), eq(imageVersions.imageId, row.image.id)))
+			.where(and(eq(imageVersions.id, versionId), eq(imageVersions.imageId, row.image.id)))
 			.limit(1);
-		if (!version) return c.json({ error: "not_found" }, 404);
-		key =
-			variant === "original"
-				? version.r2KeyFull
-				: variant === "thumb"
-					? (version.r2KeyThumb ?? version.r2KeyFull)
-					: (version.r2KeyWeb ?? version.r2KeyFull);
+		if (!version) fail(404, "not_found");
 	} else {
-		key =
-			variant === "original"
-				? row.image.currentVersionId
-					? (await currentVersionKey(c.env, row.image.id)) ?? row.image.r2KeyOriginal
-					: row.image.r2KeyOriginal
-				: variant === "thumb"
-					? (row.image.r2KeyThumb ?? keys.thumb)
-					: (row.image.r2KeyWeb ?? keys.web);
+		// Serve the CURRENT version's pixels (the old code served the
+		// image-level web variant regardless of the active version).
+		version = await currentVersion(c.env, row.image);
 	}
-	const res = await getObject(c.env.MEDIA, key);
+	const res = await getObject(c.env.MEDIA, variantKey(row.image, version, variant));
 	return res ?? c.json({ error: "not_found" }, 404);
 });
 
-async function currentVersionKey(env: Env, imageId: string): Promise<string | null> {
-	const db = createDb(env.DB);
-	const [image] = await db.select().from(images).where(eq(images.id, imageId)).limit(1);
-	if (!image?.currentVersionId) return null;
-	const [version] = await db
-		.select()
-		.from(imageVersions)
-		.where(eq(imageVersions.id, image.currentVersionId))
-		.limit(1);
-	return version?.r2KeyFull ?? null;
-}
+const uploadTooLarge = (c: Ctx) =>
+	Number(c.req.header("Content-Length") ?? 0) > MAX_UPLOAD_BYTES + 1024 * 1024;
 
-/**
- * Register an uploaded object. Two paths:
- *  - multipart POST (dev + small files): body streams through the Worker to R2
- *  - PUT to a presigned URL, then POST /images with the r2 key (production)
- */
 api.post("/albums/:id/upload", async (c) => {
 	const user = await requireUser(c);
-	const project = await ensureProject(c, user);
-	const db = createDb(c.env.DB);
-	const [album] = await db
-		.select()
-		.from(albums)
-		.where(and(eq(albums.id, c.req.param("id")), eq(albums.projectId, project.id)))
-		.limit(1);
-	if (!album) return c.json({ error: "not_found" }, 404);
-
+	const album = await requireAlbum(c, user.id, c.req.param("id"));
+	if (uploadTooLarge(c)) fail(413, "file_too_large");
+	if (!(await allow(c.env.AI_LIMITER, user.id))) fail(429, "rate_limited");
 	const form = await c.req.parseBody();
 	const file = form["file"];
-	if (!(file instanceof File)) return c.json({ error: "file_required" }, 400);
-	const declared = file.type || "application/octet-stream";
+	if (!(file instanceof File)) fail(400, "file_required");
+	if (file.size > MAX_UPLOAD_BYTES) fail(413, "file_too_large");
 	const bytes = await file.arrayBuffer();
+	if (!sniffMime(bytes)) fail(415, "not_an_image");
 
-	const sniffed = sniffMime(bytes, declared);
-	if (!sniffed) return c.json({ error: "not_an_image" }, 415);
-	const sizeError = validateImageMime(sniffed, bytes.byteLength);
-	if (sizeError) return c.json({ error: sizeError }, 413);
-
-	const imageId = crypto.randomUUID();
-	const keys = mediaKeys(user.id, album.id, imageId);
-	const ext = extForMime(sniffed);
-	const r2Key = keys.original(ext);
-	await putObject(c.env.MEDIA, r2Key, bytes, sniffed);
-
-	const dims = imageDimensions(bytes) ?? { width: 0, height: 0 };
-	const [image] = await db
-		.insert(images)
-		.values({
-			id: imageId,
-			albumId: album.id,
-			kind: "upload",
-			r2KeyOriginal: r2Key,
-			mime: sniffed,
-			widthPx: dims.width,
-			heightPx: dims.height,
-			sizeBytes: bytes.byteLength,
-			filenameLabel: file.name || `${imageId.slice(0, 8).toUpperCase()}`,
-			segmentStatus: "none",
-		})
-		.returning();
-
-	const rootVersionId = crypto.randomUUID();
-	await db.insert(imageVersions).values({
-		id: rootVersionId,
-		imageId,
-		label: "Original",
-		r2KeyFull: r2Key,
-		operation: "upload",
-	});
-	await db.update(images).set({ currentVersionId: rootVersionId }).where(eq(images.id, imageId));
-	const scoped = await deriveVariants(c.env, {
+	const { image } = await createImageFromBytes(c.env, {
 		userId: user.id,
 		albumId: album.id,
-		imageId,
-		r2KeyOriginal: r2Key,
-		mime: sniffed,
-		versionId: rootVersionId,
+		bytes,
+		kind: "upload",
+		label: "Original",
+		filenameLabel: (file.name || crypto.randomUUID().slice(0, 8).toUpperCase()).slice(0, 80),
+		operation: "upload",
 	});
-	if (scoped) {
-		await db
-			.update(imageVersions)
-			.set({ r2KeyWeb: scoped.web, r2KeyThumb: scoped.thumb })
-			.where(eq(imageVersions.id, rootVersionId));
-	}
-	if (!album.coverImageId) {
-		await db.update(albums).set({ coverImageId: imageId }).where(eq(albums.id, album.id));
-	}
-
-	// Auto-detection removed (user decision): regions are user-drawn now.
+	const db = createDb(c.env.DB);
+	await db
+		.update(albums)
+		.set({ coverImageId: album.coverImageId ?? image.id, updatedAt: new Date() })
+		.where(eq(albums.id, album.id));
 	return c.json({ image, segmentJobId: null }, 201);
 });
 
 api.patch("/images/:id", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
+	const row = await requireImage(c, user.id);
+	const body = await readJson(
+		c,
+		z.object({
+			filenameLabel: z.string().trim().min(1).max(80).optional(),
+			bookmarked: z.boolean().optional(),
+			positionIdx: z.number().int().min(0).max(1_000_000).optional(),
+		}),
+	);
 	const db = createDb(c.env.DB);
-	const body = await c.req.json<{
-		filenameLabel?: string;
-		bookmarked?: boolean;
-		positionIdx?: number;
-	}>();
 	const [updated] = await db
 		.update(images)
 		.set({
-			filenameLabel: body.filenameLabel?.slice(0, 80),
+			filenameLabel: body.filenameLabel,
 			bookmarkedAt: body.bookmarked === undefined ? undefined : body.bookmarked ? new Date() : null,
 			positionIdx: body.positionIdx,
 		})
@@ -388,18 +381,27 @@ api.patch("/images/:id", async (c) => {
 
 api.delete("/images/:id", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
+	const row = await requireImage(c, user.id);
 	const db = createDb(c.env.DB);
 	await db.delete(images).where(eq(images.id, row.image.id));
+	if (row.album.coverImageId === row.image.id) {
+		// Point the cover at another photo instead of leaving a dangling id.
+		const [next] = await db
+			.select({ id: images.id })
+			.from(images)
+			.where(eq(images.albumId, row.album.id))
+			.orderBy(images.createdAt)
+			.limit(1);
+		await db.update(albums).set({ coverImageId: next?.id ?? null }).where(eq(albums.id, row.album.id));
+	}
+	background(c, deleteImageMedia(c.env, user.id, row.album.id, row.image.id));
 	return c.json({ ok: true });
 });
 
 // Versions (plan 11)
 api.get("/images/:id/versions", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
+	const row = await requireImage(c, user.id);
 	const db = createDb(c.env.DB);
 	const versions = await db
 		.select()
@@ -411,248 +413,178 @@ api.get("/images/:id/versions", async (c) => {
 
 api.post("/images/:id/versions/:versionId/activate", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
+	const row = await requireImage(c, user.id);
 	const db = createDb(c.env.DB);
 	const [version] = await db
 		.select()
 		.from(imageVersions)
 		.where(and(eq(imageVersions.id, c.req.param("versionId")), eq(imageVersions.imageId, row.image.id)))
 		.limit(1);
-	if (!version) return c.json({ error: "not_found" }, 404);
-	// Ensure the activated version has its own web/thumb derivatives so the
-	// canvas truly switches pixels (plan 18).
+	if (!version) fail(404, "not_found");
 	if (!version.r2KeyWeb || !version.r2KeyThumb) {
-		await deriveVariantsFromVersion(c.env, user.id, row.album.id, row.image.id, version);
+		const obj = await c.env.MEDIA.get(version.r2KeyFull);
+		if (obj) {
+			const variants = await deriveVariants(c.env, {
+				userId: user.id,
+				albumId: row.album.id,
+				imageId: row.image.id,
+				versionId: version.id,
+				bytes: await obj.arrayBuffer(),
+				mime: obj.httpMetadata?.contentType ?? row.image.mime,
+			});
+			await db
+				.update(imageVersions)
+				.set({ r2KeyWeb: variants.web, r2KeyThumb: variants.thumb })
+				.where(eq(imageVersions.id, version.id));
+		}
 	}
-	await db
-		.update(images)
-		.set({ currentVersionId: version.id })
-		.where(eq(images.id, row.image.id));
+	await db.update(images).set({ currentVersionId: version.id }).where(eq(images.id, row.image.id));
 	return c.json({ ok: true, currentId: version.id });
 });
 
-/** Derive web/thumb variants from a specific version's full object and store
- * them under version-scoped keys, keeping immutable caching correct (plan 18). */
-async function deriveVariantsFromVersion(
-	env: Env,
-	userId: string,
-	albumId: string,
-	imageId: string,
-	version: typeof imageVersions.$inferSelect,
-): Promise<void> {
-	const db = createDb(env.DB);
-	const { putObject, mediaKeys } = await import("../lib/r2");
-	const { transformWithImagesBytes } = await import("../lib/operations");
-	const obj = await env.MEDIA.get(version.r2KeyFull);
-	if (!obj) return;
-	const bytes = await obj.arrayBuffer();
-	const keys = mediaKeys(userId, albumId, imageId);
-	const vKeys = {
-		web: `u/${userId}/a/${albumId}/i/${imageId}/v/${version.id}/web.webp`,
-		thumb: `u/${userId}/a/${albumId}/i/${imageId}/v/${version.id}/thumb.webp`,
-	};
-	let web: ArrayBuffer | null = null;
-	let thumb: ArrayBuffer | null = null;
-	try {
-		web = await transformWithImagesBytes(env, bytes, 1600);
-		thumb = await transformWithImagesBytes(env, bytes, 512);
-	} catch {
-		web = null;
-		thumb = null;
-	}
-	const contentType = web ? "image/webp" : "application/octet-stream";
-	await putObject(env.MEDIA, vKeys.web, web ?? bytes, contentType);
-	await putObject(env.MEDIA, vKeys.thumb, thumb ?? bytes, contentType);
-	await db
-		.update(imageVersions)
-		.set({ r2KeyWeb: vKeys.web, r2KeyThumb: vKeys.thumb })
-		.where(eq(imageVersions.id, version.id));
-	void keys;
-}
-
-// Client-side filter preset → branched photo (B&W, golden hour: deterministic
-// pixel transforms, composition-perfect, no AI model needed).
+// Deterministic client-side presets (B&W, golden hour) → branched photo.
 api.post("/images/:id/filter-branch", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
+	const row = await requireImage(c, user.id);
+	if (uploadTooLarge(c)) fail(413, "file_too_large");
+	if (!(await allow(c.env.AI_LIMITER, user.id))) fail(429, "rate_limited");
 	const form = await c.req.parseBody();
 	const file = form["file"];
-	const label = String(form["label"] ?? "Filtered");
-	if (!(file instanceof File)) return c.json({ error: "file_required" }, 400);
+	const label = String(form["label"] ?? "Filtered").trim().slice(0, 60) || "Filtered";
+	if (!(file instanceof File)) fail(400, "file_required");
+	if (file.size === 0 || file.size > MAX_UPLOAD_BYTES) fail(413, "invalid_file");
 	const bytes = await file.arrayBuffer();
-	if (bytes.byteLength === 0 || bytes.byteLength > 15 * 1024 * 1024) {
-		return c.json({ error: "invalid_file" }, 400);
-	}
-	if (!(await rateLimit(c.env, user.id, row.image.id, 20))) {
-		return c.json({ error: "rate_limited" }, 429);
-	}
-	const db = createDb(c.env.DB);
-	const imageId = crypto.randomUUID();
-	const versionId = crypto.randomUUID();
-	const keys = mediaKeys(user.id, row.album.id, imageId);
-	const r2Key = keys.original("png");
-	await c.env.MEDIA.put(r2Key, bytes, {
-		httpMetadata: { contentType: "image/png", cacheControl: "public, max-age=31536000, immutable" },
-	});
-	const { images: imagesTable } = await import("../../../database/schema");
-	await db.insert(imagesTable).values({
-		id: imageId,
+	if (!sniffMime(bytes)) fail(415, "not_an_image");
+	const { imageId, versionId } = await createImageFromBytes(c.env, {
+		userId: user.id,
 		albumId: row.album.id,
+		bytes,
 		kind: "edited",
-		r2KeyOriginal: r2Key,
-		mime: "image/png",
-		widthPx: row.image.widthPx,
-		heightPx: row.image.heightPx,
-		sizeBytes: bytes.byteLength,
-		sourceImageId: row.image.id,
-		filenameLabel: label.slice(0, 60),
-		segmentStatus: "none",
-	});
-	await db.insert(imageVersions).values({
-		id: versionId,
-		imageId,
 		label,
-		r2KeyFull: r2Key,
+		sourceImageId: row.image.id,
 		operation: "filter",
+		audit: { opClass: "adjust", model: "client:canvas" },
 	});
-	await db.update(imagesTable).set({ currentVersionId: versionId }).where(eq(imagesTable.id, imageId));
 	return c.json({ imageId, versionId }, 201);
 });
 
-// Direct whole-photo instruction edit (rebuild step 0 core loop).
+// ---------------------------------------------------------------------------
+// AI operations — all metered, rate limited, queued, job-polled
+// ---------------------------------------------------------------------------
+
+const promptSchema = z.string().trim().min(1).max(MAX_PROMPT_CHARS);
+
+// Direct whole-photo instruction edit (the editor's core loop).
 api.post("/images/:id/edit", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
-	const body = await c.req.json<{ prompt: string }>();
-	if (!body.prompt?.trim()) return c.json({ error: "prompt_required" }, 400);
-	if (!(await rateLimit(c.env, user.id, row.image.id, 12))) {
-		return c.json({ error: "rate_limited" }, 429);
-	}
-	const db = createDb(c.env.DB);
-	const origin = new URL(c.req.url).origin;
-	const jobId = await createJob(db, {
-		type: "inpaint",
-		userId: user.id,
-		imageId: row.image.id,
-		payload: { prompt: body.prompt, origin },
-	});
-	const { chargeCredits } = await import("../lib/jobs");
-	const charge = await chargeCredits(db, user.id, 2, "inpaint", jobId);
-	if (!charge.ok) {
-		await db.delete(jobs).where(eq(jobs.id, jobId));
-		return c.json({ error: "insufficient_credits", balance: charge.balance }, 402);
-	}
-	await enqueueJob(c.env.AI_JOBS, jobId, "inpaint", {
-		jobId,
-		type: "inpaint",
-		userId: user.id,
-		imageId: row.image.id,
-		prompt: body.prompt.slice(0, 500),
-		origin,
-	});
+	const row = await requireImage(c, user.id);
+	const { prompt } = await readJson(c, z.object({ prompt: promptSchema }));
+	const jobId = await startJob(
+		c,
+		user.id,
+		"inpaint",
+		{ imageId: row.image.id, prompt, origin: origin(c) },
+		{ prompt },
+	);
 	return c.json({ jobId }, 202);
 });
 
-// Region edit + enhance (plan 16) — metered, queued, job-polled.
 api.post("/images/:id/edit-region", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
-	const body = await c.req.json<{ segmentId: string; prompt?: string; mode?: string }>();
-	if (!body.segmentId) return c.json({ error: "segment_required" }, 400);
-	const segment = await ownedSegment(c.env, user.id, body.segmentId);
-	if (!segment || segment.imageId !== row.image.id) return c.json({ error: "not_found" }, 404);
-	if (segment.lockedAt) return c.json({ error: "segment_locked" }, 409);
-	if (!(await rateLimit(c.env, user.id, row.image.id, 12))) {
-		return c.json({ error: "rate_limited" }, 429);
-	}
-	const db = createDb(c.env.DB);
-	const jobId = await createJob(db, {
-		type: "inpaint",
-		userId: user.id,
-		imageId: row.image.id,
-		segmentId: segment.id,
-		payload: { prompt: body.prompt, mode: body.mode ?? "balanced" },
-	});
-	const { chargeCredits } = await import("../lib/jobs");
-	const charge = await chargeCredits(db, user.id, 2, "inpaint", jobId);
-	if (!charge.ok) {
-		await db.delete(jobs).where(eq(jobs.id, jobId));
-		return c.json({ error: "insufficient_credits", balance: charge.balance }, 402);
-	}
-	await enqueueJob(c.env.AI_JOBS, jobId, "inpaint", {
-		jobId,
-		type: "inpaint",
-		userId: user.id,
-		imageId: row.image.id,
-		segmentId: segment.id,
-		prompt: body.prompt ?? segment.caption ?? `redraw the ${segment.label}`,
-		mode: (body.mode ?? "balanced") as "literal" | "balanced" | "creative",
-	});
+	const row = await requireImage(c, user.id);
+	const body = await readJson(
+		c,
+		z.object({ segmentId: idSchema, prompt: promptSchema.optional() }),
+	);
+	const owned = await ownedSegment(c.env, user.id, body.segmentId);
+	if (!owned || owned.segment.imageId !== row.image.id) fail(404, "not_found");
+	if (owned.segment.lockedAt) fail(409, "segment_locked");
+	const prompt = body.prompt ?? owned.segment.caption ?? `redraw the ${owned.segment.label}`;
+	const jobId = await startJob(
+		c,
+		user.id,
+		"inpaint",
+		{ imageId: row.image.id, segmentId: owned.segment.id, prompt },
+		{ prompt },
+	);
 	return c.json({ jobId }, 202);
 });
 
 api.post("/images/:id/enhance", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
-	const body = await c.req.json<{ strength?: number }>().catch(() => ({}) as { strength?: number });
-	if (!(await rateLimit(c.env, user.id, row.image.id, 12))) {
-		return c.json({ error: "rate_limited" }, 429);
-	}
-	const db = createDb(c.env.DB);
-	const jobId = await createJob(db, { type: "enhance", userId: user.id, imageId: row.image.id });
-	const { chargeCredits } = await import("../lib/jobs");
-	const charge = await chargeCredits(db, user.id, 3, "enhance", jobId);
-	if (!charge.ok) {
-		await db.delete(jobs).where(eq(jobs.id, jobId));
-		return c.json({ error: "insufficient_credits", balance: charge.balance }, 402);
-	}
-	await enqueueJob(c.env.AI_JOBS, jobId, "enhance", {
-		jobId,
-		type: "enhance",
-		userId: user.id,
-		imageId: row.image.id,
-		strength: body.strength ?? 0.8,
-	});
+	const row = await requireImage(c, user.id);
+	const jobId = await startJob(c, user.id, "enhance", { imageId: row.image.id });
 	return c.json({ jobId }, 202);
 });
 
+// Background removal: segmentation (subject pixels kept, never repainted).
+api.post("/images/:id/remove-background", async (c) => {
+	const user = await requireUser(c);
+	const row = await requireImage(c, user.id);
+	const jobId = await startJob(c, user.id, "remove_bg", { imageId: row.image.id });
+	return c.json({ jobId }, 202);
+});
+
+api.post("/images/:id/resegment", async (c) => {
+	const user = await requireUser(c);
+	const row = await requireImage(c, user.id);
+	const jobId = await startJob(c, user.id, "segment", { imageId: row.image.id });
+	const db = createDb(c.env.DB);
+	await db.update(images).set({ segmentStatus: "pending" }).where(eq(images.id, row.image.id));
+	return c.json({ jobId }, 202);
+});
+
+// Prompt rewriting (plan 12) — an LLM call, so it is quota-gated too.
+api.post("/prompts/rewrite", async (c) => {
+	const user = await requireUser(c);
+	const body = await readJson(
+		c,
+		z.object({
+			text: z.string().trim().min(1).max(MAX_CHAT_CHARS),
+			operation: z.enum(["edit", "generate", "enhance"]).default("edit"),
+			context: z.string().max(500).default(""),
+		}),
+	);
+	await requireAiQuota(c.env, user.id);
+	const rewritten = await getProvider(c.env).rewritePrompt(body.text, body.operation, body.context);
+	return c.json({ rewritten });
+});
+
+// ---------------------------------------------------------------------------
 // Palettes (plan 12)
+// ---------------------------------------------------------------------------
+
 api.post("/images/:id/palette", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
-	const body = await c.req.json<{ colors: string[]; segmentId?: string }>();
-	if (!Array.isArray(body.colors) || body.colors.length === 0 || body.colors.length > 8) {
-		return c.json({ error: "invalid_colors" }, 400);
+	const row = await requireImage(c, user.id);
+	const body = await readJson(
+		c,
+		z.object({ colors: z.array(hexColor).min(1).max(8), segmentId: idSchema.optional() }),
+	);
+	if (body.segmentId) {
+		const owned = await ownedSegment(c.env, user.id, body.segmentId);
+		if (!owned || owned.segment.imageId !== row.image.id) fail(404, "not_found");
 	}
 	const db = createDb(c.env.DB);
-	const [palette] = await db
-		.insert(palettes)
-		.values({
-			id: crypto.randomUUID(),
-			ownerId: user.id,
-			colorsJson: JSON.stringify(body.colors.slice(0, 8)),
-			source: "extracted",
-		})
-		.returning();
-	await db.insert(imagePalettes).values({
-		imageId: row.image.id,
-		paletteId: palette!.id,
-		scope: body.segmentId ? "segment" : "image",
-		segmentId: body.segmentId,
-	});
-	return c.json({ palette }, 201);
+	const paletteId = crypto.randomUUID();
+	const [created] = await db.batch([
+		db
+			.insert(palettes)
+			.values({ id: paletteId, ownerId: user.id, colorsJson: JSON.stringify(body.colors), source: "extracted" })
+			.returning(),
+		db.insert(imagePalettes).values({
+			imageId: row.image.id,
+			paletteId,
+			scope: body.segmentId ? "segment" : "image",
+			segmentId: body.segmentId,
+		}),
+	]);
+	return c.json({ palette: created[0] }, 201);
 });
 
 api.get("/images/:id/palettes", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
+	const row = await requireImage(c, user.id);
 	const db = createDb(c.env.DB);
 	const rows = await db
 		.select({ palette: palettes, link: imagePalettes })
@@ -662,11 +594,13 @@ api.get("/images/:id/palettes", async (c) => {
 	return c.json({ palettes: rows });
 });
 
-// Segments (plans 9-10)
+// ---------------------------------------------------------------------------
+// Segments (plans 9-10, 20)
+// ---------------------------------------------------------------------------
+
 api.get("/images/:id/segments", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
+	const row = await requireImage(c, user.id);
 	const db = createDb(c.env.DB);
 	const rows = await db
 		.select()
@@ -675,172 +609,155 @@ api.get("/images/:id/segments", async (c) => {
 		.orderBy(segments.orderIdx);
 	// Honest labeling (plan 17): the client shows a Demo badge when the
 	// recognizer cannot actually see the image.
-	const recognizer = (c.env.AI_MOCK ?? "true").toLowerCase() === "true" ? "demo" : "live";
-	return c.json({ segments: rows, status: row.image.segmentStatus, recognizer });
+	return c.json({
+		segments: rows,
+		status: row.image.segmentStatus,
+		recognizer: isMock(c.env) ? "demo" : "live",
+	});
 });
 
-api.post("/images/:id/resegment", async (c) => {
-	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
-	const db = createDb(c.env.DB);
-	const jobId = await createJob(db, { type: "segment", userId: user.id, imageId: row.image.id });
-	await enqueueJob(c.env.AI_JOBS, jobId, "segment", { jobId, type: "segment", userId: user.id, imageId: row.image.id });
-	await db.update(images).set({ segmentStatus: "pending" }).where(eq(images.id, row.image.id));
-	return c.json({ jobId }, 202);
-});
-
-
-// Custom segment from a lasso polygon (plan 20): the drawn region becomes a
-// first-class segment — selectable, promptable, regenerable.
+// Custom segment from a lasso polygon: the drawn region becomes a segment.
 api.post("/images/:id/segments", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
-	const body = await c.req.json<{
-		label?: string;
-		polygon: Array<{ x: number; y: number }>;
-	}>();
-	if (!Array.isArray(body.polygon) || body.polygon.length < 3) {
-		return c.json({ error: "polygon_required" }, 400);
+	const row = await requireImage(c, user.id);
+	const body = await readJson(
+		c,
+		z.object({
+			label: z.string().trim().min(1).max(40).optional(),
+			polygon: z.array(z.object({ x: unit, y: unit })).min(3).max(MAX_POLYGON_POINTS),
+		}),
+	);
+	let x0 = 1;
+	let y0 = 1;
+	let x1 = 0;
+	let y1 = 0;
+	for (const p of body.polygon) {
+		x0 = Math.min(x0, p.x);
+		y0 = Math.min(y0, p.y);
+		x1 = Math.max(x1, p.x);
+		y1 = Math.max(y1, p.y);
 	}
+	if (x1 - x0 < 0.01 || y1 - y0 < 0.01) fail(400, "polygon_too_small");
 	const db = createDb(c.env.DB);
-	const xs = body.polygon.map((p) => p.x);
-	const ys = body.polygon.map((p) => p.y);
-	const x = Math.min(...xs);
-	const y = Math.min(...ys);
-	const w = Math.max(...xs) - x;
-	const h = Math.max(...ys) - y;
-	if (w < 0.01 || h < 0.01) return c.json({ error: "polygon_too_small" }, 400);
+	const id = crypto.randomUUID();
+	const maskKey = mediaKeys(user.id, row.album.id, row.image.id).segmentMask(id);
+	let hasMask = false;
+	try {
+		const mask = await buildPolygonMask(body.polygon, row.image.widthPx || 1024, row.image.heightPx || 1024);
+		await putObject(c.env.MEDIA, maskKey, mask, "image/png");
+		hasMask = true;
+	} catch (error) {
+		logWarn("polygon_mask_failed", error, { imageId: row.image.id });
+	}
+	const [maxOrder] = await db
+		.select({ max: sql<number>`COALESCE(MAX(${segments.orderIdx}), 0)` })
+		.from(segments)
+		.where(eq(segments.imageId, row.image.id));
 	const [segment] = await db
 		.insert(segments)
 		.values({
-			id: crypto.randomUUID(),
+			id,
 			imageId: row.image.id,
-			label: (body.label ?? "custom region").slice(0, 40),
+			label: body.label ?? "custom region",
 			caption: "A hand-drawn region marked by you for targeted editing.",
-			bboxX: x,
-			bboxY: y,
-			bboxW: w,
-			bboxH: h,
+			bboxX: x0,
+			bboxY: y0,
+			bboxW: x1 - x0,
+			bboxH: y1 - y0,
 			polygonJson: JSON.stringify(body.polygon),
-			orderIdx: 1000 + Math.floor(Math.random() * 1000),
+			maskR2Key: hasMask ? maskKey : null,
+			orderIdx: (maxOrder?.max ?? 0) + 1,
 		})
 		.returning();
-	// Synthesize + persist the polygon mask for region edits.
-	try {
-		const { buildPolygonMask } = await import("../lib/mask");
-		const dims = { width: row.image.widthPx || 1024, height: row.image.heightPx || 1280 };
-		const mask = await buildPolygonMask(body.polygon, dims.width, dims.height);
-		const { mediaKeys, putObject } = await import("../lib/r2");
-		const keys = mediaKeys(user.id, row.album.id, row.image.id);
-		await putObject(c.env.MEDIA, keys.segmentMask(segment.id), mask, "image/png");
-		await db
-			.update(segments)
-			.set({ maskR2Key: keys.segmentMask(segment.id) })
-			.where(eq(segments.id, segment.id));
-	} catch {
-		// edits fall back to box masks when mask synthesis fails
-	}
 	return c.json({ segment }, 201);
 });
 
 api.patch("/segments/:id", async (c) => {
 	const user = await requireUser(c);
+	const body = await readJson(
+		c,
+		z.object({
+			label: z.string().trim().min(1).max(40).optional(),
+			bbox: bboxSchema.optional(),
+			locked: z.boolean().optional(),
+			hidden: z.boolean().optional(),
+		}),
+	);
+	const owned = await ownedSegment(c.env, user.id, c.req.param("id"));
+	if (!owned) fail(404, "not_found");
 	const db = createDb(c.env.DB);
-	const body = await c.req.json<{
-		label?: string;
-		bbox?: { x: number; y: number; w: number; h: number };
-		locked?: boolean;
-		hidden?: boolean;
-	}>();
-	const segment = await ownedSegment(c.env, user.id, c.req.param("id"));
-	if (!segment) return c.json({ error: "not_found" }, 404);
 	const [updated] = await db
 		.update(segments)
 		.set({
-			label: body.label?.slice(0, 40),
+			label: body.label,
 			bboxX: body.bbox?.x,
 			bboxY: body.bbox?.y,
-			bboxW: body.bbox?.w,
-			bboxH: body.bbox?.h,
+			bboxW: body.bbox ? Math.min(body.bbox.w, 1 - body.bbox.x) : undefined,
+			bboxH: body.bbox ? Math.min(body.bbox.h, 1 - body.bbox.y) : undefined,
 			lockedAt: body.locked === undefined ? undefined : body.locked ? new Date() : null,
 			hiddenAt: body.hidden === undefined ? undefined : body.hidden ? new Date() : null,
 		})
-		.where(eq(segments.id, segment.id))
+		.where(eq(segments.id, owned.segment.id))
 		.returning();
 	return c.json({ segment: updated });
 });
 
 api.delete("/segments/:id", async (c) => {
 	const user = await requireUser(c);
-	const segment = await ownedSegment(c.env, user.id, c.req.param("id"));
-	if (!segment) return c.json({ error: "not_found" }, 404);
+	const owned = await ownedSegment(c.env, user.id, c.req.param("id"));
+	if (!owned) fail(404, "not_found");
 	const db = createDb(c.env.DB);
-	await db
-		.update(segments)
-		.set({ deletedAt: new Date() })
-		.where(eq(segments.id, segment.id));
+	await db.update(segments).set({ deletedAt: new Date() }).where(eq(segments.id, owned.segment.id));
 	return c.json({ ok: true });
 });
 
 api.get("/segments/:id/prompts", async (c) => {
 	const user = await requireUser(c);
-	const segment = await ownedSegment(c.env, user.id, c.req.param("id"));
-	if (!segment) return c.json({ error: "not_found" }, 404);
+	const owned = await ownedSegment(c.env, user.id, c.req.param("id"));
+	if (!owned) fail(404, "not_found");
 	const db = createDb(c.env.DB);
 	const rows = await db
 		.select()
 		.from(segmentPrompts)
-		.where(eq(segmentPrompts.segmentId, segment.id))
+		.where(eq(segmentPrompts.segmentId, owned.segment.id))
 		.orderBy(desc(segmentPrompts.createdAt));
-	return c.json({ prompts: rows, caption: segment.caption });
+	return c.json({ prompts: rows, caption: owned.segment.caption });
 });
 
 api.post("/segments/:id/prompts", async (c) => {
 	const user = await requireUser(c);
-	const segment = await ownedSegment(c.env, user.id, c.req.param("id"));
-	if (!segment) return c.json({ error: "not_found" }, 404);
-	const body = await c.req.json<{ text: string }>();
-	if (!body.text?.trim()) return c.json({ error: "text_required" }, 400);
+	const owned = await ownedSegment(c.env, user.id, c.req.param("id"));
+	if (!owned) fail(404, "not_found");
+	const { text } = await readJson(c, z.object({ text: z.string().trim().min(1).max(1000) }));
 	const db = createDb(c.env.DB);
-	await db
-		.update(segmentPrompts)
-		.set({ isActive: false })
-		.where(eq(segmentPrompts.segmentId, segment.id));
-	const [prompt] = await db
-		.insert(segmentPrompts)
-		.values({ id: crypto.randomUUID(), segmentId: segment.id, text: body.text.slice(0, 1000) })
-		.returning();
-	await db.update(segments).set({ hasPrompt: true }).where(eq(segments.id, segment.id));
-	return c.json({ prompt }, 201);
+	const id = crypto.randomUUID();
+	const [, inserted] = await db.batch([
+		db.update(segmentPrompts).set({ isActive: false }).where(eq(segmentPrompts.segmentId, owned.segment.id)),
+		db.insert(segmentPrompts).values({ id, segmentId: owned.segment.id, text }).returning(),
+		db.update(segments).set({ hasPrompt: true }).where(eq(segments.id, owned.segment.id)),
+	]);
+	return c.json({ prompt: inserted[0] }, 201);
 });
 
-async function ownedSegment(env: Env, userId: string, segmentId: string) {
-	const db = createDb(env.DB);
-	const [row] = await db
-		.select({ segment: segments, ownerId: projects.ownerId })
-		.from(segments)
-		.innerJoin(images, eq(images.id, segments.imageId))
-		.innerJoin(albums, eq(albums.id, images.albumId))
-		.innerJoin(projects, eq(projects.id, albums.projectId))
-		.where(eq(segments.id, segmentId))
-		.limit(1);
-	if (!row || row.ownerId !== userId) return null;
-	return row.segment;
-}
+api.get("/segments/:id/crop", async (c) => {
+	const user = await requireUser(c);
+	const owned = await ownedSegment(c.env, user.id, c.req.param("id"));
+	if (!owned) fail(404, "not_found");
+	const keys = mediaKeys(user.id, owned.albumId, owned.segment.imageId);
+	const res =
+		(await getObject(c.env.MEDIA, keys.segmentCrop(owned.segment.id))) ??
+		(await getObject(c.env.MEDIA, keys.thumb));
+	return res ?? c.json({ error: "not_found" }, 404);
+});
 
+// ---------------------------------------------------------------------------
 // Chat (plans 5-6)
+// ---------------------------------------------------------------------------
+
 api.get("/albums/:id/threads", async (c) => {
 	const user = await requireUser(c);
-	const project = await ensureProject(c, user);
+	const album = await requireAlbum(c, user.id, c.req.param("id"));
 	const db = createDb(c.env.DB);
-	const [album] = await db
-		.select()
-		.from(albums)
-		.where(and(eq(albums.id, c.req.param("id")), eq(albums.projectId, project.id)))
-		.limit(1);
-	if (!album) return c.json({ error: "not_found" }, 404);
 	const rows = await db
 		.select()
 		.from(chatThreads)
@@ -851,15 +768,9 @@ api.get("/albums/:id/threads", async (c) => {
 
 api.post("/albums/:id/threads", async (c) => {
 	const user = await requireUser(c);
-	const project = await ensureProject(c, user);
+	const album = await requireAlbum(c, user.id, c.req.param("id"));
+	const body = await readJson(c, z.object({ new: z.boolean().optional() }));
 	const db = createDb(c.env.DB);
-	const [album] = await db
-		.select()
-		.from(albums)
-		.where(and(eq(albums.id, c.req.param("id")), eq(albums.projectId, project.id)))
-		.limit(1);
-	if (!album) return c.json({ error: "not_found" }, 404);
-	const body = await c.req.json<{ new?: boolean }>().catch(() => ({}) as { new?: boolean });
 	if (!body.new) {
 		const [existing] = await db
 			.select()
@@ -869,70 +780,61 @@ api.post("/albums/:id/threads", async (c) => {
 			.limit(1);
 		if (existing) return c.json({ thread: existing, reused: true });
 	}
-	const [thread] = await db
-		.insert(chatThreads)
-		.values({ id: crypto.randomUUID(), albumId: album.id })
-		.returning();
+	const [thread] = await db.insert(chatThreads).values({ id: crypto.randomUUID(), albumId: album.id }).returning();
 	return c.json({ thread }, 201);
 });
 
-api.post("/threads/:id/messages", async (c) => {
-	const user = await requireUser(c);
+async function ownedThread(c: Ctx, userId: string) {
 	const db = createDb(c.env.DB);
-	const [thread] = await db
-		.select({ thread: chatThreads, ownerId: projects.ownerId })
+	const [row] = await db
+		.select({ thread: chatThreads })
 		.from(chatThreads)
 		.innerJoin(albums, eq(albums.id, chatThreads.albumId))
 		.innerJoin(projects, eq(projects.id, albums.projectId))
-		.where(eq(chatThreads.id, c.req.param("id")))
+		.where(and(eq(chatThreads.id, c.req.param("id") ?? ""), eq(projects.ownerId, userId)))
 		.limit(1);
-	if (!thread || thread.ownerId !== user.id) return c.json({ error: "not_found" }, 404);
-	const body = await c.req.json<{
-		text: string;
-		attachedImageId?: string;
-		segmentId?: string;
-		mentionImageIds?: string[];
-		paletteIds?: string[];
-	}>();
-	if (!body.text?.trim()) return c.json({ error: "text_required" }, 400);
-	if (!(await rateLimit(c.env, user.id, thread.thread.id, 12))) {
-		return c.json({ error: "rate_limited" }, 429);
-	}
-	const { streamAgentResponse } = await import("../agent");
+	if (!row) fail(404, "not_found");
+	return row.thread;
+}
+
+api.post("/threads/:id/messages", async (c) => {
+	const user = await requireUser(c);
+	const thread = await ownedThread(c, user.id);
+	const body = await readJson(
+		c,
+		z.object({
+			text: z.string().trim().min(1).max(MAX_CHAT_CHARS),
+			attachedImageId: idSchema.optional(),
+			segmentId: idSchema.optional(),
+			mentionImageIds: z.array(idSchema).max(10).optional(),
+			paletteIds: z.array(idSchema).max(10).optional(),
+		}),
+	);
+	await requireAiQuota(c.env, user.id);
 	const stream = streamAgentResponse(c.env, {
-		threadId: thread.thread.id,
-		albumId: thread.thread.albumId,
+		threadId: thread.id,
+		albumId: thread.albumId,
 		user,
-		text: body.text.slice(0, 2000),
-		attachedImageId: body.attachedImageId,
-		segmentId: body.segmentId,
-		mentionImageIds: body.mentionImageIds,
-		paletteIds: body.paletteIds,
+		origin: origin(c),
+		...body,
 	});
 	return new Response(stream, {
 		headers: {
 			"Content-Type": "text/event-stream",
 			"Cache-Control": "no-cache",
-			Connection: "keep-alive",
+			"X-Content-Type-Options": "nosniff",
 		},
 	});
 });
 
 api.get("/threads/:id/messages", async (c) => {
 	const user = await requireUser(c);
+	const thread = await ownedThread(c, user.id);
 	const db = createDb(c.env.DB);
-	const [thread] = await db
-		.select({ thread: chatThreads, ownerId: projects.ownerId })
-		.from(chatThreads)
-		.innerJoin(albums, eq(albums.id, chatThreads.albumId))
-		.innerJoin(projects, eq(projects.id, albums.projectId))
-		.where(eq(chatThreads.id, c.req.param("id")))
-		.limit(1);
-	if (!thread || thread.ownerId !== user.id) return c.json({ error: "not_found" }, 404);
 	const rows = await db
 		.select()
 		.from(chatMessages)
-		.where(eq(chatMessages.threadId, thread.thread.id))
+		.where(eq(chatMessages.threadId, thread.id))
 		.orderBy(chatMessages.createdAt);
 	return c.json({ messages: rows });
 });
@@ -941,129 +843,78 @@ api.get("/threads/:id/messages", async (c) => {
 api.get("/jobs/:id", async (c) => {
 	const user = await requireUser(c);
 	const db = createDb(c.env.DB);
-	const [job] = await db.select().from(jobs).where(eq(jobs.id, c.req.param("id"))).limit(1);
-	if (!job || job.userId !== user.id) return c.json({ error: "not_found" }, 404);
+	const [job] = await db
+		.select()
+		.from(jobs)
+		.where(and(eq(jobs.id, c.req.param("id")), eq(jobs.userId, user.id)))
+		.limit(1);
+	if (!job) fail(404, "not_found");
 	return c.json({ job });
 });
 
-/** Duplicate an image into the same album: copies rows + R2 objects (plan 20). */
+/** Duplicate an image (current pixels) into the same album (plan 20). */
 api.post("/images/:id/duplicate", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
-	const db = createDb(c.env.DB);
-	const newId = crypto.randomUUID();
-	const srcKeys = mediaKeys(user.id, row.album.id, row.image.id);
-	const dstKeys = mediaKeys(user.id, row.album.id, newId);
-	const ext = row.image.mime.split("/")[1] ?? "png";
-	const copies: Array<[string | null, string]> = [
-		[row.image.r2KeyOriginal, dstKeys.original(ext)],
-		[row.image.r2KeyWeb, dstKeys.web],
-		[row.image.r2KeyThumb, dstKeys.thumb],
-	];
-	for (const [src, dst] of copies) {
-		if (!src) continue;
-		const obj = await c.env.MEDIA.get(src);
-		if (obj) {
-			await c.env.MEDIA.put(dst, obj.body, {
-				httpMetadata: {
-					contentType: obj.httpMetadata?.contentType,
-					cacheControl: obj.httpMetadata?.cacheControl,
-				},
-			});
-		}
-	}
-	const [copy] = await db
-		.insert(images)
-		.values({
-			id: newId,
-			albumId: row.image.albumId,
-			kind: "upload",
-			r2KeyOriginal: dstKeys.original(ext),
-			r2KeyWeb: row.image.r2KeyWeb ? dstKeys.web : null,
-			r2KeyThumb: row.image.r2KeyThumb ? dstKeys.thumb : null,
-			mime: row.image.mime,
-			widthPx: row.image.widthPx,
-			heightPx: row.image.heightPx,
-			sizeBytes: row.image.sizeBytes,
-			filenameLabel: `${row.image.filenameLabel} copy`.slice(0, 80),
-			segmentStatus: "none",
-			positionIdx: row.image.positionIdx + 1,
-		})
-		.returning();
-	if (row.image.currentVersionId) {
-		const [ver] = await db
-			.select()
-			.from(imageVersions)
-			.where(eq(imageVersions.id, row.image.currentVersionId))
-			.limit(1);
-		if (ver) {
-			const obj = await c.env.MEDIA.get(ver.r2KeyFull);
-			if (obj) {
-				const vId = crypto.randomUUID();
-				const dstFull = dstKeys.version(vId, ver.r2KeyFull.split(".").pop() ?? "png");
-				await c.env.MEDIA.put(dstFull, obj.body, {
-					httpMetadata: {
-						contentType: obj.httpMetadata?.contentType,
-						cacheControl: obj.httpMetadata?.cacheControl,
-					},
-				});
-				await db.insert(imageVersions).values({
-					id: vId,
-					imageId: newId,
-					label: ver.label,
-					r2KeyFull: dstFull,
-				});
-				await db.update(images).set({ currentVersionId: vId }).where(eq(images.id, newId));
-			}
-		}
-	}
-	void srcKeys;
-	return c.json({ image: copy }, 201);
+	const row = await requireImage(c, user.id);
+	if (!(await allow(c.env.AI_LIMITER, user.id))) fail(429, "rate_limited");
+	const { bytes } = await loadImageBytes(c.env, row.image);
+	const { image } = await createImageFromBytes(c.env, {
+		userId: user.id,
+		albumId: row.album.id,
+		bytes,
+		kind: row.image.kind,
+		label: "Duplicate",
+		filenameLabel: `${row.image.filenameLabel} copy`,
+		sourceImageId: row.image.sourceImageId,
+		operation: "duplicate",
+	});
+	return c.json({ image }, 201);
 });
 
 // Branch family (plan 24): the source chain plus all branches off it.
 api.get("/images/:id/branch", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
+	const row = await requireImage(c, user.id);
 	const db = createDb(c.env.DB);
 	const albumImages = await db
 		.select()
 		.from(images)
 		.where(eq(images.albumId, row.album.id))
 		.orderBy(images.createdAt);
-	const map = new Map(albumImages.map((img) => [img.id, img]));
-	// Walk up to the root of this image's lineage.
+	const byId = new Map(albumImages.map((img) => [img.id, img]));
+	const children = new Map<string, string[]>();
+	for (const img of albumImages) {
+		if (!img.sourceImageId) continue;
+		children.set(img.sourceImageId, [...(children.get(img.sourceImageId) ?? []), img.id]);
+	}
 	let root = row.image;
-	for (let i = 0; i < 20; i++) {
-		const parent = root.sourceImageId ? map.get(root.sourceImageId) : null;
+	for (let i = 0; i < 50; i++) {
+		const parent = root.sourceImageId ? byId.get(root.sourceImageId) : undefined;
 		if (!parent) break;
 		root = parent;
 	}
-	// Family = the whole lineage tree rooted at `root` (bounded walk).
-	const family: typeof albumImages = [];
-	const queue: string[] = [root.id];
+	const family: ImageRow[] = [];
+	const queue = [root.id];
 	const seen = new Set<string>();
 	while (queue.length > 0 && family.length < 100) {
 		const id = queue.shift()!;
 		if (seen.has(id)) continue;
 		seen.add(id);
-		const img = map.get(id);
+		const img = byId.get(id);
 		if (!img) continue;
 		family.push(img);
-		for (const candidate of albumImages) {
-			if (candidate.sourceImageId === id) queue.push(candidate.id);
-		}
+		queue.push(...(children.get(id) ?? []));
 	}
 	return c.json({ images: family, rootId: root.id });
 });
 
-// Pinned edit instructions (annotate-then-apply, Reve-style)
+// ---------------------------------------------------------------------------
+// Pinned edit instructions (annotate-then-apply)
+// ---------------------------------------------------------------------------
+
 api.get("/images/:id/instructions", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
+	const row = await requireImage(c, user.id);
 	const db = createDb(c.env.DB);
 	const rows = await db
 		.select()
@@ -1075,24 +926,19 @@ api.get("/images/:id/instructions", async (c) => {
 
 api.post("/images/:id/instructions", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
-	const body = await c.req.json<{
-		text: string;
-		bbox: { x: number; y: number; w: number; h: number };
-	}>();
-	if (!body.text?.trim()) return c.json({ error: "text_required" }, 400);
+	const row = await requireImage(c, user.id);
+	const body = await readJson(c, z.object({ text: z.string().trim().min(1).max(300), bbox: bboxSchema }));
 	const db = createDb(c.env.DB);
 	const [instruction] = await db
 		.insert(editInstructions)
 		.values({
 			id: crypto.randomUUID(),
 			imageId: row.image.id,
-			text: body.text.slice(0, 300),
-			bboxX: Math.min(1, Math.max(0, body.bbox.x)),
-			bboxY: Math.min(1, Math.max(0, body.bbox.y)),
-			bboxW: Math.min(1, Math.max(0.005, body.bbox.w)),
-			bboxH: Math.min(1, Math.max(0.005, body.bbox.h)),
+			text: body.text,
+			bboxX: body.bbox.x,
+			bboxY: body.bbox.y,
+			bboxW: Math.min(body.bbox.w, 1 - body.bbox.x),
+			bboxH: Math.min(body.bbox.h, 1 - body.bbox.y),
 		})
 		.returning();
 	return c.json({ instruction }, 201);
@@ -1102,80 +948,83 @@ api.delete("/instructions/:id", async (c) => {
 	const user = await requireUser(c);
 	const db = createDb(c.env.DB);
 	const [row] = await db
-		.select({ ownerId: projects.ownerId })
+		.select({ id: editInstructions.id })
 		.from(editInstructions)
 		.innerJoin(images, eq(images.id, editInstructions.imageId))
 		.innerJoin(albums, eq(albums.id, images.albumId))
 		.innerJoin(projects, eq(projects.id, albums.projectId))
-		.where(eq(editInstructions.id, c.req.param("id")))
+		.where(and(eq(editInstructions.id, c.req.param("id")), eq(projects.ownerId, user.id)))
 		.limit(1);
-	if (!row || row.ownerId !== user.id) return c.json({ error: "not_found" }, 404);
-	await db.delete(editInstructions).where(eq(editInstructions.id, c.req.param("id")));
+	if (!row) fail(404, "not_found");
+	await db.delete(editInstructions).where(eq(editInstructions.id, row.id));
 	return c.json({ ok: true });
 });
 
-/** Apply every pending instruction on the image in ONE generation pass,
- * producing a branched photo auto-titled from the instructions. */
+/** Apply pending instructions in ONE generation pass → branched photo.
+ * `instructionIds` limits the batch (the editor sends just the new chip, so
+ * stale chips from an earlier failed attempt are not silently re-applied). */
 api.post("/images/:id/apply-instructions", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
+	const row = await requireImage(c, user.id);
+	// Each chip is its own crop-edit-composite pass, so cap a batch at 5.
+	const body = await readJson(c, z.object({ instructionIds: z.array(idSchema).min(1).max(5).optional() }));
 	const db = createDb(c.env.DB);
 	const pending = await db
 		.select()
 		.from(editInstructions)
-		.where(and(eq(editInstructions.imageId, row.image.id), eq(editInstructions.status, "pending")))
-		.orderBy(editInstructions.createdAt);
-	if (pending.length === 0) return c.json({ error: "no_instructions" }, 400);
-	if (!(await rateLimit(c.env, user.id, row.image.id, 12))) {
-		return c.json({ error: "rate_limited" }, 429);
-	}
-	const instructions = pending.map((p) => ({ text: p.text, bbox: { x: p.bboxX, y: p.bboxY, w: p.bboxW, h: p.bboxH } }));
+		.where(
+			and(
+				eq(editInstructions.imageId, row.image.id),
+				eq(editInstructions.status, "pending"),
+				body.instructionIds ? inArray(editInstructions.id, body.instructionIds) : undefined,
+			),
+		)
+		.orderBy(editInstructions.createdAt)
+		.limit(5);
+	if (pending.length === 0) fail(400, "no_instructions");
+	const instructions = pending.map((p) => ({
+		text: p.text,
+		bbox: { x: p.bboxX, y: p.bboxY, w: p.bboxW, h: p.bboxH },
+	}));
 	const label = autoTitleFromInstructions(pending.map((p) => p.text));
-	const jobId = await createJob(db, {
-		type: "batch_edit",
-		userId: user.id,
-		imageId: row.image.id,
-		payload: { instructions, label },
-	});
-	const { chargeCredits } = await import("../lib/jobs");
-	const charge = await chargeCredits(db, user.id, 2, "batch_edit", jobId);
-	if (!charge.ok) {
-		await db.delete(jobs).where(eq(jobs.id, jobId));
-		return c.json({ error: "insufficient_credits", balance: charge.balance }, 402);
-	}
-	await enqueueJob(c.env.AI_JOBS, jobId, "batch_edit", {
-		jobId,
-		type: "batch_edit",
-		userId: user.id,
-		imageId: row.image.id,
-		instructions,
-		label,
-	});
+	const jobId = await startJob(
+		c,
+		user.id,
+		"batch_edit",
+		{ imageId: row.image.id, instructions, instructionIds: pending.map((p) => p.id), label },
+		{ instructions, label },
+	);
 	return c.json({ jobId, label }, 202);
 });
 
 /** "change sunglass to eyeglass" -> "Eyeglass & business coat" style titles. */
-function autoTitleFromInstructions(texts: string[]): string {
+export function autoTitleFromInstructions(texts: string[]): string {
 	const targets = texts.map((t) => {
 		const m = /(?:change|make|turn|replace|reupholster|convert)[\w\s]*?\bto\s+(.{2,40})/i.exec(t);
-		return (m ? m[1] : t).trim().replace(/[.!?]+$/, "");
+		return (m ? m[1]! : t).trim().replace(/[.!?]+$/, "");
 	});
 	const joined = targets.join(" & ");
 	const titled = joined.charAt(0).toUpperCase() + joined.slice(1);
 	return titled.slice(0, 60) || "Edited photo";
 }
 
+// ---------------------------------------------------------------------------
 // Share (plan 13)
+// ---------------------------------------------------------------------------
+
 api.post("/images/:id/share", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
-	const body = await c.req.json<{ allowDownload?: boolean; expiresInHours?: number }>().catch(
-		() => ({}) as { allowDownload?: boolean; expiresInHours?: number },
+	const row = await requireImage(c, user.id);
+	const body = await readJson(
+		c,
+		z.object({
+			allowDownload: z.boolean().default(true),
+			expiresInHours: z.number().int().min(1).max(24 * 365).optional(),
+		}),
 	);
 	const db = createDb(c.env.DB);
-	const token = crypto.randomUUID().replace(/-/g, "").slice(0, 22);
+	const bytes = crypto.getRandomValues(new Uint8Array(16));
+	const token = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 	const [link] = await db
 		.insert(shareLinks)
 		.values({
@@ -1183,10 +1032,8 @@ api.post("/images/:id/share", async (c) => {
 			token,
 			userId: user.id,
 			imageId: row.image.id,
-			allowDownload: body.allowDownload ?? true,
-			expiresAt: body.expiresInHours
-				? new Date(Date.now() + body.expiresInHours * 3600_000)
-				: null,
+			allowDownload: body.allowDownload,
+			expiresAt: body.expiresInHours ? new Date(Date.now() + body.expiresInHours * 3600_000) : null,
 		})
 		.returning();
 	return c.json({ share: link, url: `/s/${token}` }, 201);
@@ -1195,60 +1042,64 @@ api.post("/images/:id/share", async (c) => {
 api.delete("/share/:id", async (c) => {
 	const user = await requireUser(c);
 	const db = createDb(c.env.DB);
-	await db
+	const [revoked] = await db
 		.update(shareLinks)
 		.set({ revokedAt: new Date() })
-		.where(and(eq(shareLinks.id, c.req.param("id")), eq(shareLinks.userId, user.id)));
+		.where(and(eq(shareLinks.id, c.req.param("id")), eq(shareLinks.userId, user.id)))
+		.returning({ id: shareLinks.id });
+	if (!revoked) fail(404, "not_found");
 	return c.json({ ok: true });
 });
 
-// Public share resolution (no auth)
+/** Resolve a share token to a live link + image, or 404. Access is always
+ * by TOKEN: knowing an image id grants nothing. */
+async function liveShare(env: Env, token: string) {
+	const db = createDb(env.DB);
+	const [row] = await db
+		.select({ link: shareLinks, image: images })
+		.from(shareLinks)
+		.innerJoin(images, eq(images.id, shareLinks.imageId))
+		.where(eq(shareLinks.token, token))
+		.limit(1);
+	if (!row || row.link.revokedAt || (row.link.expiresAt && row.link.expiresAt.getTime() < Date.now())) {
+		return null;
+	}
+	return row;
+}
+
 api.get("/public/share/:token", async (c) => {
-	const db = createDb(c.env.DB);
-	const [link] = await db
-		.select()
-		.from(shareLinks)
-		.where(eq(shareLinks.token, c.req.param("token")))
-		.limit(1);
-	if (!link || link.revokedAt || (link.expiresAt && link.expiresAt.getTime() < Date.now())) {
-		return c.json({ error: "not_found" }, 404);
-	}
-	return c.json({ share: { allowDownload: link.allowDownload, imageId: link.imageId } });
+	const share = await liveShare(c.env, c.req.param("token"));
+	if (!share) fail(404, "not_found");
+	return c.json({
+		share: { allowDownload: share.link.allowDownload, title: share.image.filenameLabel },
+	});
 });
 
-api.get("/public/images/:id/file", async (c) => {
-	const db = createDb(c.env.DB);
-	const [link] = await db
-		.select()
-		.from(shareLinks)
-		.where(eq(shareLinks.imageId, c.req.param("id")))
-		.orderBy(desc(shareLinks.createdAt))
-		.limit(1);
-	if (!link || link.revokedAt || (link.expiresAt && link.expiresAt.getTime() < Date.now())) {
-		return c.json({ error: "not_found" }, 404);
+/** Public file: the web variant for viewing; the full-resolution original
+ * ONLY when the owner allowed downloads (previously ignored). */
+api.get("/public/share/:token/file", async (c) => {
+	const share = await liveShare(c.env, c.req.param("token"));
+	if (!share) fail(404, "not_found");
+	const variant = variantSchema.parse(c.req.query("variant"));
+	if (variant === "original" && !share.link.allowDownload) fail(403, "download_disabled");
+	const version = await currentVersion(c.env, share.image);
+	const res = await getObject(c.env.MEDIA, variantKey(share.image, version, variant), {
+		cacheControl: "private, max-age=300",
+	});
+	if (!res) fail(404, "not_found");
+	if (variant === "original") {
+		res.headers.set("Content-Disposition", `attachment; filename="editorium-${share.image.id.slice(0, 8)}"`);
 	}
-	const [image] = await db.select().from(images).where(eq(images.id, c.req.param("id"))).limit(1);
-	if (!image) return c.json({ error: "not_found" }, 404);
-	const key = image.currentVersionId
-		? (
-				(
-					await db
-						.select()
-						.from(imageVersions)
-						.where(eq(imageVersions.id, image.currentVersionId))
-						.limit(1)
-				)[0]?.r2KeyFull ?? image.r2KeyOriginal
-			)
-		: image.r2KeyOriginal;
-	const res = await getObject(c.env.MEDIA, key);
-	return res ?? c.json({ error: "not_found" }, 404);
+	return res;
 });
 
+// ---------------------------------------------------------------------------
 // Canvas text annotations (plan 20)
+// ---------------------------------------------------------------------------
+
 api.get("/images/:id/annotations", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
+	const row = await requireImage(c, user.id);
 	const db = createDb(c.env.DB);
 	const rows = await db
 		.select()
@@ -1260,28 +1111,21 @@ api.get("/images/:id/annotations", async (c) => {
 
 api.post("/images/:id/annotations", async (c) => {
 	const user = await requireUser(c);
-	const row = await ownedImage(c, c.env, user.id);
-	if (!row) return c.json({ error: "not_found" }, 404);
-	const body = await c.req.json<{
-		text: string;
-		normX?: number;
-		normY?: number;
-		fontSize?: number;
-		color?: string;
-	}>();
-	if (!body.text?.trim()) return c.json({ error: "text_required" }, 400);
+	const row = await requireImage(c, user.id);
+	const body = await readJson(
+		c,
+		z.object({
+			text: z.string().trim().min(1).max(300),
+			normX: unit.default(0.5),
+			normY: unit.default(0.5),
+			fontSize: z.number().min(0.01).max(0.3).default(0.04),
+			color: hexColor.default("#ffffff"),
+		}),
+	);
 	const db = createDb(c.env.DB);
 	const [annotation] = await db
 		.insert(imageAnnotations)
-		.values({
-			id: crypto.randomUUID(),
-			imageId: row.image.id,
-			text: body.text.slice(0, 300),
-			normX: Math.min(1, Math.max(0, body.normX ?? 0.5)),
-			normY: Math.min(1, Math.max(0, body.normY ?? 0.5)),
-			fontSize: body.fontSize ?? 0.04,
-			color: body.color ?? "#ffffff",
-		})
+		.values({ id: crypto.randomUUID(), imageId: row.image.id, ...body })
 		.returning();
 	return c.json({ annotation }, 201);
 });
@@ -1290,30 +1134,16 @@ api.delete("/annotations/:id", async (c) => {
 	const user = await requireUser(c);
 	const db = createDb(c.env.DB);
 	const [row] = await db
-		.select({ ownerId: projects.ownerId })
+		.select({ id: imageAnnotations.id })
 		.from(imageAnnotations)
 		.innerJoin(images, eq(images.id, imageAnnotations.imageId))
 		.innerJoin(albums, eq(albums.id, images.albumId))
 		.innerJoin(projects, eq(projects.id, albums.projectId))
-		.where(eq(imageAnnotations.id, c.req.param("id")))
+		.where(and(eq(imageAnnotations.id, c.req.param("id")), eq(projects.ownerId, user.id)))
 		.limit(1);
-	if (!row || row.ownerId !== user.id) return c.json({ error: "not_found" }, 404);
-	await db.delete(imageAnnotations).where(eq(imageAnnotations.id, c.req.param("id")));
+	if (!row) fail(404, "not_found");
+	await db.delete(imageAnnotations).where(eq(imageAnnotations.id, row.id));
 	return c.json({ ok: true });
-});
-
-// Prompt rewriting (plan 12)
-api.post("/prompts/rewrite", async (c) => {
-	await requireUser(c);
-	const body = await c.req.json<{ text: string; operation?: string; context?: string }>();
-	if (!body.text?.trim()) return c.json({ error: "text_required" }, 400);
-	const provider = getProvider(c.env);
-	const rewritten = await provider.rewritePrompt(
-		body.text,
-		body.operation ?? "edit",
-		body.context ?? "",
-	);
-	return c.json({ rewritten });
 });
 
 // Usage (plan 13)
@@ -1321,81 +1151,28 @@ api.get("/usage", async (c) => {
 	const user = await requireUser(c);
 	const db = createDb(c.env.DB);
 	const rows = await db
-		.select({ reason: sql`reason`, total: sql<number>`COUNT(*)`, credits: sql<number>`SUM(delta)` })
-		.from(sql`credit_events`)
-		.where(sql`user_id = ${user.id}`)
-		.groupBy(sql`reason`);
+		.select({
+			reason: creditEvents.reason,
+			total: sql<number>`COUNT(*)`,
+			credits: sql<number>`SUM(${creditEvents.delta})`,
+		})
+		.from(creditEvents)
+		.where(eq(creditEvents.userId, user.id))
+		.groupBy(creditEvents.reason);
 	return c.json({ balance: user.creditBalance, events: rows });
-});
-
-// Simple per-user sliding-window rate limit for AI-heavy routes (plan 13).
-export async function rateLimit(
-	env: Env,
-	userId: string,
-	_windowKey: string,
-	maxPerMinute: number,
-): Promise<boolean> {
-	const db = createDb(env.DB);
-	const since = new Date(Date.now() - 60_000);
-	const result = await db
-		.select({ count: sql<number>`COUNT(*)` })
-		.from(jobs)
-		.where(
-			and(
-				eq(jobs.userId, userId),
-				sql`${jobs.createdAt} > ${since.getTime()}`,
-				or(eq(jobs.type, "generate"), eq(jobs.type, "enhance"), eq(jobs.type, "inpaint")),
-			),
-		);
-	return (result[0]?.count ?? 0) < maxPerMinute;
-}
-
-
-/** Trigger the segmentation workflow with a typed payload cast. */
-export async function createSegmentWorkflow(
-	env: Env,
-	jobId: string,
-	userId: string,
-): Promise<string | null> {
-	if (!env.SEGMENT_WORKFLOW) return null;
-	const binding = env.SEGMENT_WORKFLOW as unknown as {
-		create(opts: { payload: { jobId: string; userId: string } }): Promise<{ id: string }>;
-	};
-	const instance = await binding.create({ payload: { jobId, userId } });
-	return instance.id;
-}
-
-api.get("/segments/:id/crop", async (c) => {
-	const user = await requireUser(c);
-	const segment = await ownedSegment(c.env, user.id, c.req.param("id"));
-	if (!segment) return c.json({ error: "not_found" }, 404);
-	const db = createDb(c.env.DB);
-	const [row] = await db
-		.select({ image: images, albumId: albums.id })
-		.from(images)
-		.innerJoin(albums, eq(albums.id, images.albumId))
-		.where(eq(images.id, segment.imageId))
-		.limit(1);
-	if (!row) return c.json({ error: "not_found" }, 404);
-	const keys = mediaKeys(user.id, row.albumId, row.image.id);
-	const res =
-		(await getObject(c.env.MEDIA, keys.segmentCrop(segment.id))) ??
-		(await getObject(c.env.MEDIA, keys.thumb));
-	return res ?? c.json({ error: "not_found" }, 404);
 });
 
 // Signed public image URL — lets external services (Pruna P-Image family)
 // fetch a photo without exposing the album.
 api.get("/pub/img/:token", async (c) => {
-	const { verifyPublicImageUrl } = await import("../lib/sign");
 	const imageId = await verifyPublicImageUrl(c.env, c.req.param("token"));
-	if (!imageId) return c.json({ error: "invalid_or_expired" }, 404);
+	if (!imageId) fail(404, "invalid_or_expired");
 	const db = createDb(c.env.DB);
 	const [image] = await db.select().from(images).where(eq(images.id, imageId)).limit(1);
-	if (!image) return c.json({ error: "not_found" }, 404);
-	const key = image.currentVersionId
-		? ((await db.select().from(imageVersions).where(eq(imageVersions.id, image.currentVersionId)).limit(1))[0]?.r2KeyFull ?? image.r2KeyOriginal)
-		: image.r2KeyOriginal;
-	const res = await getObject(c.env.MEDIA, key);
+	if (!image) fail(404, "not_found");
+	const version = await currentVersion(c.env, image);
+	const res = await getObject(c.env.MEDIA, variantKey(image, version, "original"), {
+		cacheControl: "private, no-store",
+	});
 	return res ?? c.json({ error: "not_found" }, 404);
 });

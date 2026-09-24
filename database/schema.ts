@@ -1,10 +1,12 @@
 import { sql } from "drizzle-orm";
 import {
 	foreignKey,
+	index,
 	integer,
 	real,
 	sqliteTable,
 	text,
+	uniqueIndex,
 } from "drizzle-orm/sqlite-core";
 
 const now = sql`(unixepoch() * 1000)`;
@@ -29,18 +31,25 @@ export const users = sqliteTable("users", {
 		.default(now),
 });
 
-export const projects = sqliteTable("projects", {
-	id: text("id").primaryKey(),
-	ownerId: text("owner_id")
-		.notNull()
-		.references(() => users.id, { onDelete: "cascade" }),
-	name: text("name").notNull(),
-	createdAt: integer("created_at", { mode: "timestamp_ms" })
-		.notNull()
-		.default(now),
-});
+export const projects = sqliteTable(
+	"projects",
+	{
+		id: text("id").primaryKey(),
+		ownerId: text("owner_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		name: text("name").notNull(),
+		createdAt: integer("created_at", { mode: "timestamp_ms" })
+			.notNull()
+			.default(now),
+	},
+	// One default project per user: concurrent first requests converge.
+	(t) => [uniqueIndex("projects_owner_unique").on(t.ownerId)],
+);
 
-export const albums = sqliteTable("albums", {
+export const albums = sqliteTable(
+	"albums",
+	{
 	id: text("id").primaryKey(),
 	projectId: text("project_id")
 		.notNull()
@@ -53,7 +62,9 @@ export const albums = sqliteTable("albums", {
 	updatedAt: integer("updated_at", { mode: "timestamp_ms" })
 		.notNull()
 		.default(now),
-});
+	},
+	(t) => [index("albums_project_idx").on(t.projectId)],
+);
 
 export const images = sqliteTable(
 	"images",
@@ -90,10 +101,14 @@ export const images = sqliteTable(
 			foreignColumns: [t.id],
 			name: "images_source_fk",
 		}).onDelete("set null"),
+		index("images_album_idx").on(t.albumId, t.positionIdx),
+		index("images_source_idx").on(t.sourceImageId),
 	],
 );
 
-export const imageVersions = sqliteTable("image_versions", {
+export const imageVersions = sqliteTable(
+	"image_versions",
+	{
 	id: text("id").primaryKey(),
 	imageId: text("image_id")
 		.notNull()
@@ -105,12 +120,20 @@ export const imageVersions = sqliteTable("image_versions", {
 	r2KeyThumb: text("r2_key_thumb"),
 	prompt: text("prompt"),
 	operation: text("operation"),
+	/** Phase 4 audit: fidelity class, producing model, guard score (r). */
+	opClass: text("op_class"),
+	model: text("model"),
+	fidelity: real("fidelity"),
 	createdAt: integer("created_at", { mode: "timestamp_ms" })
 		.notNull()
 		.default(now),
-});
+	},
+	(t) => [index("image_versions_image_idx").on(t.imageId)],
+);
 
-export const segments = sqliteTable("segments", {
+export const segments = sqliteTable(
+	"segments",
+	{
 	id: text("id").primaryKey(),
 	imageId: text("image_id")
 		.notNull()
@@ -132,9 +155,13 @@ export const segments = sqliteTable("segments", {
 	createdAt: integer("created_at", { mode: "timestamp_ms" })
 		.notNull()
 		.default(now),
-});
+	},
+	(t) => [index("segments_image_idx").on(t.imageId, t.orderIdx)],
+);
 
-export const segmentPrompts = sqliteTable("segment_prompts", {
+export const segmentPrompts = sqliteTable(
+	"segment_prompts",
+	{
 	id: text("id").primaryKey(),
 	segmentId: text("segment_id")
 		.notNull()
@@ -144,9 +171,13 @@ export const segmentPrompts = sqliteTable("segment_prompts", {
 	createdAt: integer("created_at", { mode: "timestamp_ms" })
 		.notNull()
 		.default(now),
-});
+	},
+	(t) => [index("segment_prompts_segment_idx").on(t.segmentId)],
+);
 
-export const chatThreads = sqliteTable("chat_threads", {
+export const chatThreads = sqliteTable(
+	"chat_threads",
+	{
 	id: text("id").primaryKey(),
 	albumId: text("album_id")
 		.notNull()
@@ -155,9 +186,13 @@ export const chatThreads = sqliteTable("chat_threads", {
 	createdAt: integer("created_at", { mode: "timestamp_ms" })
 		.notNull()
 		.default(now),
-});
+	},
+	(t) => [index("chat_threads_album_idx").on(t.albumId)],
+);
 
-export const chatMessages = sqliteTable("chat_messages", {
+export const chatMessages = sqliteTable(
+	"chat_messages",
+	{
 	id: text("id").primaryKey(),
 	threadId: text("thread_id")
 		.notNull()
@@ -177,9 +212,13 @@ export const chatMessages = sqliteTable("chat_messages", {
 	createdAt: integer("created_at", { mode: "timestamp_ms" })
 		.notNull()
 		.default(now),
-});
+	},
+	(t) => [index("chat_messages_thread_idx").on(t.threadId, t.createdAt)],
+);
 
-export const editInstructions = sqliteTable("edit_instructions", {
+export const editInstructions = sqliteTable(
+	"edit_instructions",
+	{
 	id: text("id").primaryKey(),
 	imageId: text("image_id")
 		.notNull()
@@ -196,12 +235,16 @@ export const editInstructions = sqliteTable("edit_instructions", {
 	createdAt: integer("created_at", { mode: "timestamp_ms" })
 		.notNull()
 		.default(now),
-});
+	},
+	(t) => [index("edit_instructions_image_idx").on(t.imageId, t.status)],
+);
 
-export const jobs = sqliteTable("jobs", {
+export const jobs = sqliteTable(
+	"jobs",
+	{
 	id: text("id").primaryKey(),
 	type: text("type", {
-		enum: ["segment", "generate", "enhance", "inpaint", "caption", "thumb", "batch_edit"],
+		enum: ["segment", "generate", "enhance", "inpaint", "caption", "thumb", "batch_edit", "remove_bg"],
 	}).notNull(),
 	userId: text("user_id").notNull(),
 	imageId: text("image_id"),
@@ -221,7 +264,9 @@ export const jobs = sqliteTable("jobs", {
 		.notNull()
 		.default(now),
 	finishedAt: integer("finished_at", { mode: "timestamp_ms" }),
-});
+	},
+	(t) => [index("jobs_user_created_idx").on(t.userId, t.createdAt)],
+);
 
 export const palettes = sqliteTable("palettes", {
 	id: text("id").primaryKey(),
@@ -235,7 +280,9 @@ export const palettes = sqliteTable("palettes", {
 		.default(now),
 });
 
-export const imagePalettes = sqliteTable("image_palettes", {
+export const imagePalettes = sqliteTable(
+	"image_palettes",
+	{
 	imageId: text("image_id")
 		.notNull()
 		.references(() => images.id, { onDelete: "cascade" }),
@@ -246,7 +293,9 @@ export const imagePalettes = sqliteTable("image_palettes", {
 		.notNull()
 		.default("image"),
 	segmentId: text("segment_id"),
-});
+	},
+	(t) => [index("image_palettes_image_idx").on(t.imageId)],
+);
 
 export const references = sqliteTable("references", {
 	id: text("id").primaryKey(),
@@ -260,7 +309,9 @@ export const references = sqliteTable("references", {
 		.default(now),
 });
 
-export const shareLinks = sqliteTable("share_links", {
+export const shareLinks = sqliteTable(
+	"share_links",
+	{
 	id: text("id").primaryKey(),
 	token: text("token").notNull().unique(),
 	userId: text("user_id").notNull(),
@@ -274,9 +325,13 @@ export const shareLinks = sqliteTable("share_links", {
 	createdAt: integer("created_at", { mode: "timestamp_ms" })
 		.notNull()
 		.default(now),
-});
+	},
+	(t) => [index("share_links_image_idx").on(t.imageId)],
+);
 
-export const creditEvents = sqliteTable("credit_events", {
+export const creditEvents = sqliteTable(
+	"credit_events",
+	{
 	id: text("id").primaryKey(),
 	userId: text("user_id")
 		.notNull()
@@ -287,11 +342,15 @@ export const creditEvents = sqliteTable("credit_events", {
 	createdAt: integer("created_at", { mode: "timestamp_ms" })
 		.notNull()
 		.default(now),
-});
+	},
+	(t) => [index("credit_events_user_idx").on(t.userId)],
+);
 
 /** Canvas text annotations (plan 20): rendered over the image and baked
  * into the download export. Positions are normalized 0..1. */
-export const imageAnnotations = sqliteTable("image_annotations", {
+export const imageAnnotations = sqliteTable(
+	"image_annotations",
+	{
 	id: text("id").primaryKey(),
 	imageId: text("image_id")
 		.notNull()
@@ -304,7 +363,9 @@ export const imageAnnotations = sqliteTable("image_annotations", {
 	createdAt: integer("created_at", { mode: "timestamp_ms" })
 		.notNull()
 		.default(now),
-});
+	},
+	(t) => [index("image_annotations_image_idx").on(t.imageId)],
+);
 
 export type ImageAnnotation = typeof imageAnnotations.$inferSelect;
 export type User = typeof users.$inferSelect;

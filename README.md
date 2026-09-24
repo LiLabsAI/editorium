@@ -1,83 +1,67 @@
-# Cloudflare SaaS Template
+# Editorium
 
-A reusable full-stack application foundation for React applications running on Cloudflare Workers.
+An AI photo editor on Cloudflare Workers. Upload a photo, describe a change (or draw a region and describe it), and every edit becomes a **new photo beside the original** — the original never changes.
 
-## Included
+## Architecture
 
-- React 19 and React Router 8
-- Vite with the Cloudflare Workers plugin
-- Hono for `/api/*` endpoints
-- Cloudflare D1 with Drizzle ORM and versioned SQL migrations
-- Tailwind CSS 4 and shadcn/ui
-- Zod, React Hook Form, and Sonner
-- Strict TypeScript and ESLint
-- Browser and Workers-runtime tests with Vitest
-- Workers observability and uploaded source maps
-- CI verification with pnpm
+- **SPA** — React 19 + React Router 8 + Tailwind 4 (`src/react-app`), served as Workers static assets.
+- **API** — Hono on one Worker (`src/worker`): `routes/api.ts`, `routes/auth.ts`.
+- **Data** — D1 via Drizzle (`database/schema.ts`, migrations in `drizzle/`); media in R2 under `u/<user>/a/<album>/i/<image>/…`.
+- **AI jobs** — every model call runs on the `editorium-ai-jobs` Queue (`src/worker/queue.ts`); clients poll `/api/jobs/:id`.
+- **Image operations** — each has a fidelity contract (see `plans/phase4/index.md`):
+  - *Enhance* — Images binding ESRGAN upscale + sharpen (same content).
+  - *Remove background* — Images binding `segment: "foreground"` (subject untouched).
+  - *Region edit* — FLUX.2 on a padded crop, composited back through a feathered mask (outside the region is byte-identical).
+  - *Reimagine* — free-text whole-photo edit: Pruna P-Image-Edit, else FLUX.2 with the photo as `input_image_0`.
+  - Every result passes a fidelity guard (`src/worker/lib/fidelity.ts`) before it is saved; failures are refunded.
+- **Images binding** — variants, EXIF-correct dimensions, crops, upscaling, segmentation, compositing (`src/worker/lib/pixels.ts`).
 
-Authentication, organizations, billing, email, object storage, queues, and analytics are intentionally opt-in so each application only adopts the services it needs.
+## Accounts
 
-## Requirements
+Every browser gets its own private **guest account** (`POST /api/auth/guest`, rate-limited per IP). Sessions are HMAC-signed cookies keyed by the `AUTH_SECRET` secret.
 
-- Node.js 22.22 or newer
-- pnpm 11.5 or newer
+The pre-auth demo account (`OWNER_USER_ID` in `wrangler.json`) is restored by opening **`/claim`** and entering the `OWNER_CLAIM_KEY` secret.
+
+## Secrets
+
+Declared in `wrangler.json` under `secrets.required`; deploy fails if either is missing. Never put them in `vars`.
+
+| Secret | Purpose |
+|---|---|
+| `AUTH_SECRET` | Signs sessions and short-lived image URLs (≥ 32 chars) |
+| `OWNER_CLAIM_KEY` | Unlocks `/claim` for the owner account |
+
+Local development reads them from `.dev.vars` (git-ignored). Production:
+
+```bash
+openssl rand -hex 32 | pnpm exec wrangler secret put AUTH_SECRET
+```
 
 ## Development
 
 ```bash
 pnpm install
-pnpm db:migrate
+pnpm db:migrate   # local D1 under .wrangler/
 pnpm dev
 ```
 
-The Vite development server runs the API in the Cloudflare Workers runtime. `pnpm db:migrate` applies pending migrations to the local D1 database stored under `.wrangler/`.
-
-## Database
-
-The `DB` binding is configured in `wrangler.json`, the Drizzle schema lives in `database/schema.ts`, and generated SQL migrations are committed under `drizzle/`. The included `app_metadata` table is a generic starting point for non-secret application metadata; add application-specific tables to the same schema.
-
-After changing the schema, generate and verify a migration, then apply it locally:
-
-```bash
-pnpm db:generate
-pnpm db:check
-pnpm db:migrate
-```
-
-The committed database ID is only a local-development placeholder. Before the first remote deployment, create a D1 database and copy the returned `database_id` into `wrangler.json`:
-
-```bash
-pnpm exec wrangler d1 create editorium-db
-pnpm cf-typegen
-pnpm deploy
-```
-
-Keep the binding name as `DB`. `pnpm deploy` applies pending remote migrations before it deploys Worker code, preserving the required schema-before-code order.
+`wrangler.json` sets `AI_MOCK="false"`, so local dev calls the real (billed) Workers AI models. Tests always use the offline mock provider.
 
 ## Verification
 
 ```bash
-pnpm typecheck
-pnpm db:check
-pnpm lint
-pnpm test
-pnpm build
-pnpm check
+pnpm check   # drizzle check, lint, app + worker tests, build, deploy dry-run
 ```
 
-`pnpm check` validates Drizzle migrations, runs linting, browser tests, Worker integration tests against an isolated D1 database, creates the production build, and performs a Wrangler deployment dry-run.
-
-## Cloudflare configuration
-
-Treat `wrangler.json` as the source of truth. After changing bindings, variables, compatibility flags, or environments, regenerate Worker types:
+Worker tests (`test/worker`) run in the Workers runtime with an isolated D1, R2 and Queue, including the queue consumer end to end. They use a mock AI provider, which cannot detect a real model ignoring its input — so after changing any model adapter, also run:
 
 ```bash
-pnpm cf-typegen
+pnpm probe:models   # production pixel code vs live Images + Workers AI; outputs in .probe/
 ```
 
-Store production secrets with Wrangler or Cloudflare Secrets Store; never put them in `vars` or commit them to the repository.
+## Deploy
 
-## Deploy and rollback
+Schema before code: `pnpm deploy` applies remote D1 migrations, then deploys.
 
 ```bash
 pnpm check
@@ -86,4 +70,4 @@ pnpm exec wrangler versions list
 pnpm exec wrangler rollback
 ```
 
-Create separate staging and production resources before serving real users or customer data.
+After changing bindings in `wrangler.json`, run `pnpm cf-typegen`.

@@ -2,40 +2,19 @@ import { eq } from "drizzle-orm";
 import type { Context } from "hono";
 
 import { projects, users, type User } from "../../../database/schema";
+import { SESSION_MAX_AGE_S } from "./config";
+import { fromBase64Url, mac, safeEqual, toBase64Url } from "./crypto";
 import { createDb } from "./db";
+import { fail } from "./http";
 
 const COOKIE = "ed_session";
-const MAX_AGE = 60 * 60 * 24 * 30;
 
-function toBase64Url(bytes: Uint8Array): string {
-	let binary = "";
-	for (const b of bytes) binary += String.fromCharCode(b);
-	return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function fromBase64Url(text: string): Uint8Array {
-	const padded = text.replace(/-/g, "+").replace(/_/g, "/");
-	const binary = atob(padded + "=".repeat((4 - (padded.length % 4)) % 4));
-	const bytes = new Uint8Array(binary.length);
-	for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-	return bytes;
-}
-
-async function sign(payload: string, secret: string): Promise<string> {
-	const key = await crypto.subtle.importKey(
-		"raw",
-		new TextEncoder().encode(secret),
-		{ name: "HMAC", hash: "SHA-256" },
-		false,
-		["sign"],
-	);
-	const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
-	return toBase64Url(new Uint8Array(mac));
-}
+type Ctx = Context<{ Bindings: Env }>;
 
 export async function makeSessionToken(userId: string, secret: string): Promise<string> {
 	const payload = `${userId}.${Date.now()}`;
-	return `${toBase64Url(new TextEncoder().encode(payload))}.${await sign(payload, secret)}`;
+	const encoded = toBase64Url(new TextEncoder().encode(payload));
+	return `${encoded}.${await mac("session", payload, secret)}`;
 }
 
 export async function readSessionToken(
@@ -43,33 +22,36 @@ export async function readSessionToken(
 	secret: string,
 ): Promise<string | null> {
 	if (!token) return null;
-	const [encoded, mac] = token.split(".");
-	if (!encoded || !mac) return null;
-	const payload = new TextDecoder().decode(fromBase64Url(encoded));
-	const expected = await sign(payload, secret);
-	if (expected.length !== mac.length) return null;
-	// Constant-time-ish comparison over equal-length base64url strings.
-	let diff = 0;
-	for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ mac.charCodeAt(i);
-	if (diff !== 0) return null;
+	const parts = token.split(".");
+	if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+	const bytes = fromBase64Url(parts[0]);
+	if (!bytes) return null;
+	const payload = new TextDecoder().decode(bytes);
+	if (!safeEqual(await mac("session", payload, secret), parts[1])) return null;
 	const dot = payload.lastIndexOf(".");
-	if (dot < 0) return null;
+	if (dot <= 0) return null;
 	const userId = payload.slice(0, dot);
-	const ts = Number(payload.slice(dot + 1));
-	if (!userId || !Number.isFinite(ts)) return null;
-	if (Date.now() - ts > MAX_AGE * 1000) return null;
+	const issuedAt = Number(payload.slice(dot + 1));
+	if (!Number.isFinite(issuedAt)) return null;
+	const age = Date.now() - issuedAt;
+	if (age < -60_000 || age > SESSION_MAX_AGE_S * 1000) return null;
 	return userId;
 }
 
-export function sessionCookie(token: string): string {
-	return `${COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${MAX_AGE}`;
+function cookieFlags(c: Ctx, maxAge: number): string {
+	const secure = new URL(c.req.url).protocol === "https:" ? "; Secure" : "";
+	return `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`;
 }
 
-export function clearCookie(): string {
-	return `${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
+export function sessionCookie(c: Ctx, token: string): string {
+	return `${COOKIE}=${token}; ${cookieFlags(c, SESSION_MAX_AGE_S)}`;
 }
 
-function readCookie(c: Context<{ Bindings: Env }>): string | undefined {
+export function clearCookie(c: Ctx): string {
+	return `${COOKIE}=; ${cookieFlags(c, 0)}`;
+}
+
+function readCookie(c: Ctx): string | undefined {
 	return c.req
 		.header("Cookie")
 		?.split(";")
@@ -79,7 +61,7 @@ function readCookie(c: Context<{ Bindings: Env }>): string | undefined {
 }
 
 /** Resolve the signed-in user, or null for anonymous requests. */
-export async function getUser(c: Context<{ Bindings: Env }>): Promise<User | null> {
+export async function getUser(c: Ctx): Promise<User | null> {
 	const userId = await readSessionToken(readCookie(c), c.env.AUTH_SECRET);
 	if (!userId) return null;
 	const db = createDb(c.env.DB);
@@ -87,24 +69,26 @@ export async function getUser(c: Context<{ Bindings: Env }>): Promise<User | nul
 	return user ?? null;
 }
 
-/** Require a signed-in user; throws a tagged error mapped to 401 by onError. */
-export async function requireUser(
-	c: Context<{ Bindings: Env }>,
-): Promise<User> {
+/** Require a signed-in user; anonymous requests get a 401 via onError. */
+export async function requireUser(c: Ctx): Promise<User> {
 	const user = await getUser(c);
-	if (!user) {
-		const err = new Error("unauthorized") as Error & { status?: number };
-		err.status = 401;
-		throw err;
-	}
+	if (!user) fail(401, "unauthorized");
 	return user;
 }
 
-/** Create (or fetch) the user's default project. */
-export async function ensureProject(
-	c: Context<{ Bindings: Env }>,
-	user: User,
-) {
+/** Create a fresh, private guest account (never an existing one). */
+export async function createGuest(env: Env): Promise<User> {
+	const db = createDb(env.DB);
+	const [user] = await db
+		.insert(users)
+		.values({ id: crypto.randomUUID(), name: "Guest" })
+		.returning();
+	return user!;
+}
+
+/** Create (or fetch) the user's default project. The unique index on
+ * projects.owner_id makes concurrent first requests converge on one row. */
+export async function ensureProject(c: Ctx, user: User) {
 	const db = createDb(c.env.DB);
 	const [existing] = await db
 		.select()
@@ -112,13 +96,18 @@ export async function ensureProject(
 		.where(eq(projects.ownerId, user.id))
 		.limit(1);
 	if (existing) return existing;
-	const [project] = await db
+	await db
 		.insert(projects)
 		.values({
 			id: crypto.randomUUID(),
 			ownerId: user.id,
 			name: `${user.name.split(" ")[0]}'s Project`,
 		})
-		.returning();
+		.onConflictDoNothing({ target: projects.ownerId });
+	const [project] = await db
+		.select()
+		.from(projects)
+		.where(eq(projects.ownerId, user.id))
+		.limit(1);
 	return project!;
 }

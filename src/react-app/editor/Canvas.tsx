@@ -32,14 +32,13 @@ export function EditorCanvas({
 		container: { left: 0, top: 0, width: 0, height: 0 },
 		img: { left: 0, top: 0, width: 0, height: 0 },
 	});
-	const screenRef = useRef<Rect>({ left: 0, top: 0, width: 0, height: 0 });
 	const [imgRect, setImgRect] = useState<Rect>({ left: 0, top: 0, width: 0, height: 0 });
+	const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
 	const panning = useRef(false);
 	const [rect, setRect] = useState<Bbox | null>(null);
 	const [text, setText] = useState("");
 	const [compare, setCompare] = useState(false);
 	const [wipe, setWipe] = useState(50);
-	void screenRef;
 	const drawing = useRef<{ x: number; y: number } | null>(null);
 
 	const naturalWidth = image.widthPx || FALLBACK.width;
@@ -54,8 +53,10 @@ export function EditorCanvas({
 			const c = container.getBoundingClientRect();
 			const img = { left: r.left - c.left, top: r.top - c.top, width: r.width, height: r.height };
 			const cont = { left: c.left, top: c.top, width: c.width, height: c.height };
-			screenRef.current = cont;
 			rectsRef.current = { container: cont, img };
+			setContainerSize((prev) =>
+				prev.width === c.width && prev.height === c.height ? prev : { width: c.width, height: c.height },
+			);
 			setImgRect((prev) =>
 				prev.left === img.left && prev.top === img.top && prev.width === img.width && prev.height === img.height
 					? prev
@@ -150,8 +151,13 @@ export function EditorCanvas({
 		setRect({ x: pt.x, y: pt.y, w: 0.005, h: 0.005 });
 	};
 
+	/** Pointer → normalized image space, clamped to the photo so a drag past
+	 * the edge still yields a valid 0..1 region. */
 	function normFromClient(clientX: number, clientY: number) {
-		return toNorm(clientX, clientY, rectsRef.current.container, rectsRef.current.img);
+		const pt = toNorm(clientX, clientY, rectsRef.current.container, rectsRef.current.img);
+		if (!pt) return null;
+		const clamp = (v: number) => Math.min(1, Math.max(0, v));
+		return { x: clamp(pt.x), y: clamp(pt.y) };
 	}
 
 	const onRegionPointerMove = (e: React.PointerEvent) => {
@@ -262,8 +268,10 @@ export function EditorCanvas({
 				<div
 					className="absolute z-20 w-72 rounded-xl border ed-hairline bg-card p-2 shadow-2xl"
 					style={{
-						left: Math.max(8, Math.min((rect.x + rect.w) * imgRect.width + imgRect.left, imgRect.width - 300)),
-						top: Math.max(8, Math.min((rect.y + rect.h) * imgRect.height + imgRect.top + 8, imgRect.height - 140)),
+						// Anchor at the selection's bottom-right, clamped to the
+						// visible container (not the possibly-zoomed image).
+						left: Math.max(8, Math.min((rect.x + rect.w) * imgRect.width + imgRect.left, containerSize.width - 296)),
+						top: Math.max(8, Math.min((rect.y + rect.h) * imgRect.height + imgRect.top + 8, containerSize.height - 140)),
 					}}
 					onPointerDown={(e) => e.stopPropagation()}
 				>
@@ -310,7 +318,12 @@ export function EditorCanvas({
 				</div>
 			)}
 			{sourceUrl && (
-				<div className="absolute bottom-4 right-4 flex items-center gap-2 rounded-full bg-black/65 px-3 py-1.5">
+				<div
+					className="absolute bottom-4 right-4 flex items-center gap-2 rounded-full bg-black/65 px-3 py-1.5"
+					// Controls sit over the canvas: don't let a click here start
+					// a region draw (pointer capture would swallow the click).
+					onPointerDown={(e) => e.stopPropagation()}
+				>
 					<button
 						aria-pressed={compare}
 						onClick={() => setCompare((v) => !v)}

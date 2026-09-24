@@ -62,14 +62,40 @@
 			"class_name": "SegmentWorkflow"
 		}
 	],
+	/**
+	 * Per-location, eventually consistent limiters (first line of defence);
+	 * the D1 job-count check in lib/limits.ts is the exact backstop.
+	 */
+	"ratelimits": [
+		{
+			// AI-cost routes, keyed by user id.
+			"name": "AI_LIMITER",
+			"namespace_id": "1001",
+			"simple": { "limit": 20, "period": 60 }
+		},
+		{
+			// Anonymous auth routes (guest creation, owner claim), keyed by client IP.
+			"name": "AUTH_LIMITER",
+			"namespace_id": "1002",
+			"simple": { "limit": 5, "period": 60 }
+		}
+	],
+	/**
+	 * Never put secrets in `vars`. Set them with `wrangler secret put` (prod)
+	 * or `.dev.vars` (local). Deploy fails if either is missing.
+	 */
+	"secrets": {
+		"required": ["AUTH_SECRET", "OWNER_CLAIM_KEY"]
+	},
 	"vars": {
 		/**
-		 * AI_MOCK=true keeps every AI call local and deterministic (no account
-		 * usage). Flip to "false" and run `wrangler dev` while logged in to use
-		 * the real Workers AI models below.
+		 * Production runs the real Workers AI models below. Tests override this
+		 * to "true" (vitest.worker.config.ts) so they never spend AI usage.
 		 */
 		"AI_MOCK": "false",
-		"AUTH_SECRET": "dev-only-insecure-set-via-wrangler-secret-in-prod",
+		/** The pre-auth demo account; reclaimed via POST /api/auth/claim. */
+		"OWNER_USER_ID": "1fbf74ad-5db9-4996-a744-0bc17ce30ad6",
+		"MODEL_EDIT_PRIMARY": "pruna/p-image-edit",
 		"MODEL_DETECT_MOONDREAM": "@cf/moondream/moondream3.1-9B-A2B",
 		"MODEL_VLM": "@cf/meta/llama-3.2-11b-vision-instruct",
 		"MODEL_VLM_SECONDARY": "@cf/zai-org/glm-5.3-flash",

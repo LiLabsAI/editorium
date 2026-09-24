@@ -1,12 +1,24 @@
-import { eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { NonRetryableError } from "cloudflare:workflows";
 import { WorkflowEntrypoint, WorkflowStep } from "cloudflare:workers";
 
-import { images, jobs } from "../../database/schema";
+import { images, jobs, segments, type ImageRow } from "../../database/schema";
 import { createDb } from "./lib/db";
+import { assertFidelity, toPixelBox, type OperationClass } from "./lib/fidelity";
 import { finishJob } from "./lib/jobs";
-import { loadImageBytes, storeOperationResult } from "./lib/operations";
-import { getProvider, MODE_STRENGTH, type ReferenceMode } from "./lib/providers";
+import { buildAlphaMask } from "./lib/mask";
+import { loadModelInput, loadWorkingImage, logWarn, storeOperationResult } from "./lib/operations";
+import { pixelOps, type PixelBox } from "./lib/pixels";
+import {
+	closestAspect,
+	editDims,
+	getProvider,
+	isMock,
+	ProviderError,
+	referenceDims,
+} from "./lib/providers";
+import { decodeImageOutput } from "./lib/providers/workersai";
+import { imageDimensions } from "./lib/r2";
 import {
 	markSegmentStatus,
 	persistSegments,
@@ -14,16 +26,14 @@ import {
 	runDetection,
 	type SegmentationContext,
 } from "./lib/segmentation";
+import { signPublicImageUrl } from "./lib/sign";
 
 /**
- * SegmentWorkflow (plan 9): durable auto-recognition with retry + status
- * queries via the binding. The heavy pipeline runs in one retried step and
- * reports granular progress into the jobs table as it goes.
+ * SegmentWorkflow (plan 9): durable auto-recognition with retry. The queue
+ * consumer is the executor in use today (queue.ts); this class stays exported
+ * because the `editorium-segment` Workflow binding is deployed.
  */
-export class SegmentWorkflow extends WorkflowEntrypoint<
-	Env,
-	{ jobId: string; userId: string }
-> {
+export class SegmentWorkflow extends WorkflowEntrypoint<Env, { jobId: string; userId: string }> {
 	override async run(
 		event: { payload: { jobId: string; userId: string } },
 		step: WorkflowStep,
@@ -45,279 +55,320 @@ export class SegmentWorkflow extends WorkflowEntrypoint<
 			{ retries: { limit: 3, delay: "5 seconds", backoff: "exponential" } },
 			async () => {
 				const db = createDb(this.env.DB);
-				const [image] = await db
-					.select()
-					.from(images)
-					.where(eq(images.id, target.imageId))
-					.limit(1);
+				const [image] = await db.select().from(images).where(eq(images.id, target.imageId)).limit(1);
 				if (!image) throw new NonRetryableError("image not found");
-				const { bytes, mime } = await loadImageBytes(this.env, image);
-				const ctx: SegmentationContext = {
-					env: this.env,
-					imageId: image.id,
-					userId,
-					albumId: target.albumId,
-					imageBytes: bytes,
-					mime,
-					widthPx: image.widthPx,
-					heightPx: image.heightPx,
-				};
-				await markSegmentStatus(this.env, image.id, "pending");
-				const tree = await runDetection(ctx, (p) => reportProgress(this.env, jobId, p));
-				const captioned = await runCaptioning(ctx, tree, (p) =>
-					reportProgress(this.env, jobId, p),
-				);
-				const count = await persistSegments(ctx, captioned.nodes);
-				await markSegmentStatus(this.env, image.id, captioned.partial ? "partial" : "ready");
-				return { segments: count };
+				return { segments: await runSegmentation(this.env, jobId, userId, image) };
 			},
 		);
 
 		await step.do("finish", async () => {
-			const db = createDb(this.env.DB);
-			await finishJob(db, jobId, "done");
-			console.log(
-				JSON.stringify({
-					event: "segmentation_completed",
-					jobId,
-					imageId: target.imageId,
-					segments: stored.segments,
-				}),
-			);
+			await finishJob(createDb(this.env.DB), jobId, "done");
 		});
-
 		return stored;
 	}
 }
 
-async function reportProgress(env: Env, jobId: string, progress: number): Promise<void> {
+/** Shared recognition pipeline (queue consumer + workflow). */
+export async function runSegmentation(
+	env: Env,
+	jobId: string,
+	userId: string,
+	image: ImageRow,
+): Promise<number> {
 	const db = createDb(env.DB);
-	await db.update(jobs).set({ progress, status: "running" }).where(eq(jobs.id, jobId));
+	const { bytes, mime } = await loadModelInput(env, image);
+	// Crops are computed on the model-input pixels, not the stored original.
+	const dims = imageDimensions(bytes) ?? { width: image.widthPx, height: image.heightPx };
+	const ctx: SegmentationContext = {
+		env,
+		imageId: image.id,
+		userId,
+		albumId: image.albumId,
+		imageBytes: bytes,
+		mime,
+		widthPx: dims.width,
+		heightPx: dims.height,
+	};
+	const progress = async (p: number): Promise<void> => {
+		await db.update(jobs).set({ progress: p, status: "running" }).where(eq(jobs.id, jobId));
+	};
+	await markSegmentStatus(env, image.id, "pending");
+	const tree = await runDetection(ctx, progress);
+	const captioned = await runCaptioning(ctx, tree, progress);
+	const count = await persistSegments(ctx, captioned.nodes);
+	await markSegmentStatus(env, image.id, captioned.partial ? "partial" : "ready");
+	console.log(JSON.stringify({ event: "segmentation_completed", jobId, imageId: image.id, segments: count }));
+	return count;
 }
 
-/** Whole-photo instruction edit: no region, no mask — the FLUX edit model
- * applies the instruction across the frame. */
-export async function runWholePhotoEdit(
+export type JobResult = { imageId: string; versionId: string };
+
+type Box = { x: number; y: number; w: number; h: number };
+
+/*
+ * Phase 4 runners. Each operation class uses a tool that cannot break its
+ * contract, and every result passes the fidelity guard before it is stored
+ * (plans/phase4/index.md):
+ *   enhance   → Images ESRGAN + sharpen            (same content)
+ *   segment   → Images BiRefNet background removal  (subject pixels kept)
+ *   local     → FLUX.2 on a padded crop + composite (outside region untouched)
+ *   reimagine → Pruna / FLUX.2 with the photo       (guarded against ignoring it)
+ *   generate  → text-to-image                       (new photo)
+ */
+
+async function store(
 	env: Env,
 	userId: string,
-	source: typeof images.$inferSelect,
-	prompt: string,
-	origin?: string,
-): Promise<{ imageId: string; versionId: string }> {
-	const provider = getProvider(env);
-	const { bytes, mime } = await loadImageBytes(env, source);
-
-	// Primary: Pruna P-Image-Edit (instruction-based editing that preserves
-	// the input composition). Needs a publicly fetchable signed URL.
-	if (origin) {
-		try {
-			const { signPublicImageUrl } = await import("./lib/sign");
-			const imageUrl = `${origin}${await signPublicImageUrl(env, source.id, 600)}`;
-			const gen = await (env.AI as { run: (m: string, input: unknown) => Promise<unknown> }).run(
-				"pruna/p-image-edit",
-				{
-					prompt: `${prompt}. Keep the rest of the photograph exactly unchanged.`,
-					images: [imageUrl],
-					aspect_ratio: source.widthPx && source.heightPx
-						? `${source.widthPx}:${source.heightPx}`
-						: "1:1",
-				},
-			);
-			if (gen && typeof gen === "object" && "image" in (gen as object)) {
-				const b64img = (gen as { image: string }).image;
-				if (b64img) {
-					const bin = atob(b64img);
-					const buf = new Uint8Array(bin.length);
-					for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
-					return storeOperationResult(env, {
-						userId,
-						albumId: source.albumId,
-						source,
-						operation: "edit",
-						label: `AI edit: ${prompt.slice(0, 40)}`,
-						prompt,
-						result: { data: buf.buffer as ArrayBuffer, mime: "image/png", width: source.widthPx || 1024, height: source.heightPx || 1024 },
-					});
-				}
-			}
-		} catch {
-			// Pruna unavailable — fall through to SDXL multipart
-		}
-	}
-
-	const gen = await provider.inpaint(
-		bytes,
-		mime,
-		null,
-		{ x: 0, y: 0, w: 1, h: 1 },
-		prompt,
-		{ width: source.widthPx || 1024, height: source.heightPx || 1024 },
-	);
+	albumId: string,
+	source: ImageRow | null,
+	result: { data: ArrayBuffer; mime: string; width?: number; height?: number },
+	meta: { operation: string; label: string; prompt?: string; opClass: OperationClass; model: string; fidelity: number | null },
+): Promise<JobResult> {
 	return storeOperationResult(env, {
 		userId,
-		albumId: source.albumId,
+		albumId,
 		source,
-		operation: "edit",
-		label: prompt.slice(0, 40) || "Edited photo",
-		prompt,
-		result: gen,
+		operation: meta.operation,
+		label: meta.label,
+		prompt: meta.prompt,
+		result: { data: result.data, mime: result.mime, width: result.width ?? 0, height: result.height ?? 0 },
+		audit: { opClass: meta.opClass, model: meta.model, fidelity: meta.fidelity },
 	});
 }
 
+/** "Enhance (AI)": ESRGAN upscale + sharpen via the Images binding. A
+ * restoration model adds detail; it cannot invent a different subject. */
+export async function runEnhanceJob(env: Env, userId: string, source: ImageRow): Promise<JobResult> {
+	const ops = pixelOps(env);
+	const working = await loadWorkingImage(env, source);
+	const out = await ops.enhance(working.bytes);
+	const score = await assertFidelity(ops, "enhance", working.bytes, out.bytes);
+	return store(env, userId, source.albumId, source, { data: out.bytes, mime: out.mime }, {
+		operation: "enhance",
+		label: "Enhanced",
+		opClass: "enhance",
+		model: out.model,
+		fidelity: score?.r ?? null,
+	});
+}
 
-/** Batch edit (Reve-style annotate-then-apply): every pinned instruction is
- * folded into ONE coherent FLUX edit instruction so a single generation
- * applies all changes. */
-export async function runBatchEditJob(
+/** "Remove background": BiRefNet segmentation — subject pixels are kept
+ * exactly, the background becomes transparent. Nothing is repainted. */
+export async function runRemoveBackgroundJob(env: Env, userId: string, source: ImageRow): Promise<JobResult> {
+	const ops = pixelOps(env);
+	const working = await loadWorkingImage(env, source);
+	const out = await ops.removeBackground(working.bytes);
+	const score = await assertFidelity(ops, "segment", working.bytes, out.bytes);
+	return store(env, userId, source.albumId, source, { data: out.bytes, mime: out.mime }, {
+		operation: "remove_bg",
+		label: "Background removed",
+		opClass: "segment",
+		model: isMock(env) ? "mock:segment" : "images:segment-foreground",
+		fidelity: score?.r ?? null,
+	});
+}
+
+/** Crop around a region with context so the edit model sees surroundings. */
+function paddedCrop(inner: PixelBox, width: number, height: number): PixelBox {
+	const pad = Math.round(Math.max(inner.width, inner.height) * 0.35);
+	const minSide = Math.min(256, width, height);
+	let left = Math.max(0, inner.left - pad);
+	let top = Math.max(0, inner.top - pad);
+	let right = Math.min(width, inner.left + inner.width + pad);
+	let bottom = Math.min(height, inner.top + inner.height + pad);
+	if (right - left < minSide) {
+		left = Math.max(0, Math.min(left, width - minSide));
+		right = Math.min(width, left + minSide);
+	}
+	if (bottom - top < minSide) {
+		top = Math.max(0, Math.min(top, height - minSide));
+		bottom = Math.min(height, top + minSide);
+	}
+	return { left, top, width: right - left, height: bottom - top };
+}
+
+/**
+ * Local edit: for each region, crop it (with context), edit the crop with the
+ * reference-edit model, and composite the result back through a feathered
+ * mask. Pixels outside every region are the original's — guaranteed by the
+ * compositing, and verified by the fidelity guard.
+ */
+export async function runLocalEdit(
 	env: Env,
 	userId: string,
-	source: typeof images.$inferSelect,
-	instructions: Array<{
-		text: string;
-		bbox: { x: number; y: number; w: number; h: number };
-	}>,
+	source: ImageRow,
+	regions: Array<{ text: string; box: Box }>,
 	label: string,
-): Promise<{ imageId: string; versionId: string }> {
+): Promise<JobResult> {
+	const ops = pixelOps(env);
 	const provider = getProvider(env);
-	const { bytes, mime } = await loadImageBytes(env, source);
-	const combined = instructions.map((i, idx) => `${idx + 1}. ${i.text}`).join("; ");
-	const gen = await provider.inpaint(
-		bytes,
-		mime,
-		null,
-		{ x: 0, y: 0, w: 1, h: 1 },
-		`Apply all of these edits, in order: ${combined}. Apply each change to the ` +
-			`region it refers to; keep the person, animals, background, lighting, and ` +
-			`composition otherwise exactly unchanged.`,
-		{ width: source.widthPx || 1024, height: source.heightPx || 1024 },
-	);
-	return storeOperationResult(env, {
-		userId,
-		albumId: source.albumId,
-		source,
+	const working = await loadWorkingImage(env, source);
+	const { width, height } = await ops.dims(working.bytes);
+	let current = working.bytes;
+	let model = "";
+	const changed: Box[] = [];
+	for (const region of regions) {
+		const inner = toPixelBox(region.box, width, height);
+		const crop = paddedCrop(inner, width, height);
+		const cropped = await ops.crop(current, crop);
+		const ref = referenceDims(crop.width, crop.height);
+		const reference = await ops.resize(cropped.bytes, ref.width, ref.height);
+		const edited = await provider.editWithReference(
+			reference,
+			`${region.text}. Keep the composition, framing, lighting and every other detail of this image exactly the same.`,
+			editDims(crop.width, crop.height),
+		);
+		model = edited.model;
+		const feather = Math.max(4, Math.round(Math.min(inner.width, inner.height) * 0.06));
+		const mask = await buildAlphaMask(
+			crop.width,
+			crop.height,
+			{ left: inner.left - crop.left, top: inner.top - crop.top, width: inner.width, height: inner.height },
+			feather,
+		);
+		current = (await ops.composite(current, edited.data, mask, crop)).bytes;
+		changed.push({
+			x: Math.max(0, (inner.left - feather) / width),
+			y: Math.max(0, (inner.top - feather) / height),
+			w: Math.min(1, (inner.width + 2 * feather) / width),
+			h: Math.min(1, (inner.height + 2 * feather) / height),
+		});
+	}
+	const score = await assertFidelity(ops, "local", working.bytes, current, { regions: changed });
+	return store(env, userId, source.albumId, source, { data: current, mime: isMock(env) ? "image/png" : "image/jpeg" }, {
 		operation: "edit",
 		label,
-		prompt: combined,
-		result: gen,
+		prompt: regions.map((r) => r.text).join("; "),
+		opClass: "local",
+		model,
+		fidelity: score?.r ?? null,
 	});
 }
 
-/** Queue-consumer operation runners (generate / enhance / inpaint). */
-export async function runGenerateJob(
-	env: Env,
-	userId: string,
-	source: typeof images.$inferSelect,
-	prompt: string,
-	aspect?: string,
-): Promise<{ imageId: string; versionId: string }> {
-	const provider = getProvider(env);
-	const gen = await provider.textToImage(prompt, { aspect });
-	return storeOperationResult(env, {
-		userId,
-		albumId: source.albumId,
-		source,
-		operation: "generate",
-		label: prompt.slice(0, 48) || "Generated image",
-		prompt,
-		result: gen,
-	});
-}
-
-export async function runEnhanceJob(
-	env: Env,
-	userId: string,
-	source: typeof images.$inferSelect,
-	strength: number,
-): Promise<{ imageId: string; versionId: string }> {
-	const provider = getProvider(env);
-	const { bytes, mime } = await loadImageBytes(env, source);
-	const factor = strength >= 0.8 ? 4 : 2;
-	const gen = await provider.upscale(bytes, mime, factor);
-	return storeOperationResult(env, {
-		userId,
-		albumId: source.albumId,
-		source,
-		operation: "enhance",
-		label: `High-quality ${factor}K enhance`,
-		result: gen,
-	});
-}
-
+/** Region edit on a stored segment (selected layer). */
 export async function runInpaintJob(
 	env: Env,
 	userId: string,
-	source: typeof images.$inferSelect,
+	source: ImageRow,
 	segmentId: string,
 	prompt: string,
-	mode: ReferenceMode,
-): Promise<{ imageId: string; versionId: string }> {
+): Promise<JobResult> {
 	const db = createDb(env.DB);
-	const { segments } = await import("../../database/schema");
-	const [segment] = await db.select().from(segments).where(eq(segments.id, segmentId)).limit(1);
-	if (!segment) throw new NonRetryableError("segment not found");
-	const provider = getProvider(env);
-	const { bytes, mime } = await loadImageBytes(env, source);
-	const dims = { width: source.widthPx || 1024, height: source.heightPx || 1024 };
+	const [segment] = await db
+		.select()
+		.from(segments)
+		.where(and(eq(segments.id, segmentId), eq(segments.imageId, source.id), isNull(segments.deletedAt)))
+		.limit(1);
+	if (!segment) throw new ProviderError("segment not found");
+	if (segment.lockedAt) throw new ProviderError("segment is locked");
+	return runLocalEdit(
+		env,
+		userId,
+		source,
+		[{ text: prompt, box: { x: segment.bboxX, y: segment.bboxY, w: segment.bboxW, h: segment.bboxH } }],
+		`Edited ${segment.label}`,
+	);
+}
 
-	// Creative mode: FLUX.2 instruction edit — best-in-class prompt following,
-	// whole-image coherence. Literal/Balanced: mask-constrained SD inpainting.
-	if (mode === "creative") {
-		const edited = await provider.inpaint(
-			bytes,
-			mime,
-			null,
-			{ x: segment.bboxX, y: segment.bboxY, w: segment.bboxW, h: segment.bboxH },
-			`${prompt}. Keep everything else in the photograph unchanged.`,
-			dims,
-		);
-		void MODE_STRENGTH;
-		return storeOperationResult(env, {
-			userId,
-			albumId: source.albumId,
-			source,
-			operation: "edit",
-			label: `AI edit ${segment.label}`,
-			prompt,
-			result: edited,
-		});
+/** Annotate-then-apply chips: each chip is a local edit of its own region. */
+export async function runBatchEditJob(
+	env: Env,
+	userId: string,
+	source: ImageRow,
+	instructions: Array<{ text: string; bbox: Box }>,
+	label: string,
+): Promise<JobResult> {
+	return runLocalEdit(
+		env,
+		userId,
+		source,
+		instructions.map((i) => ({ text: i.text, box: i.bbox })),
+		label,
+	);
+}
+
+/**
+ * Reimagine (free-text whole-photo edit). Primary: Pruna P-Image-Edit via a
+ * signed URL. Fallback: FLUX.2 with the photo as its reference. Either way
+ * the guard rejects a result unrelated to the photo.
+ */
+export async function runWholePhotoEdit(
+	env: Env,
+	userId: string,
+	source: ImageRow,
+	prompt: string,
+	origin?: string,
+): Promise<JobResult> {
+	const ops = pixelOps(env);
+	const working = await loadWorkingImage(env, source);
+	const { width, height } = await ops.dims(working.bytes);
+	const dims = editDims(width, height);
+
+	if (origin && env.MODEL_EDIT_PRIMARY && !isMock(env)) {
+		// Only the model call is guarded: storage failures must surface.
+		let decoded: { data: ArrayBuffer; mime: string } | null = null;
+		try {
+			const imageUrl = `${origin}${await signPublicImageUrl(env, source.id)}`;
+			const out = await (env.AI as unknown as { run: (m: string, i: unknown) => Promise<unknown> }).run(
+				env.MODEL_EDIT_PRIMARY,
+				{
+					prompt: `${prompt}. Keep the rest of the photograph exactly unchanged.`,
+					images: [imageUrl],
+					aspect_ratio: closestAspect(width, height),
+				},
+			);
+			decoded = await decodeImageOutput(out);
+			if (!decoded) logWarn("pruna_edit_empty_output", "no image in response", { imageId: source.id });
+		} catch (error) {
+			logWarn("pruna_edit_failed", error, { imageId: source.id });
+		}
+		if (decoded) {
+			const score = await assertFidelity(ops, "reimagine", working.bytes, decoded.data);
+			return store(env, userId, source.albumId, source, decoded, {
+				operation: "edit",
+				label: prompt.slice(0, 40) || "Reimagined",
+				prompt,
+				opClass: "reimagine",
+				model: env.MODEL_EDIT_PRIMARY,
+				fidelity: score?.r ?? null,
+			});
+		}
 	}
 
-	let mask: ArrayBuffer | null = null;
-	if (segment.maskR2Key) {
-		const obj = await env.MEDIA.get(segment.maskR2Key);
-		if (obj) mask = await obj.arrayBuffer();
-	}
-	if (!mask) {
-		// Synthesize a feathered box mask once and persist it for reuse.
-		const { buildBoxMask } = await import("./lib/mask");
-		mask = await buildBoxMask(
-			{ x: segment.bboxX, y: segment.bboxY, w: segment.bboxW, h: segment.bboxH },
-			dims.width,
-			dims.height,
-		);
-		const { mediaKeys, putObject } = await import("./lib/r2");
-		const keys = mediaKeys(userId, source.albumId, source.id);
-		await putObject(env.MEDIA, keys.segmentMask(segment.id), mask, "image/png");
-		await db
-			.update(segments)
-			.set({ maskR2Key: keys.segmentMask(segment.id) })
-			.where(eq(segments.id, segment.id));
-	}
-	const gen = await provider.inpaint(
-		bytes,
-		mime,
-		mask,
-		{ x: segment.bboxX, y: segment.bboxY, w: segment.bboxW, h: segment.bboxH },
-		prompt,
+	const ref = referenceDims(width, height);
+	const reference = await ops.resize(working.bytes, ref.width, ref.height);
+	const edited = await getProvider(env).editWithReference(
+		reference,
+		`${prompt}. Keep the people, composition, framing and lighting the same.`,
 		dims,
 	);
-	return storeOperationResult(env, {
-		userId,
-		albumId: source.albumId,
-		source,
+	const score = await assertFidelity(ops, "reimagine", working.bytes, edited.data);
+	return store(env, userId, source.albumId, source, edited, {
 		operation: "edit",
-		label: `Edited ${segment.label}`,
+		label: prompt.slice(0, 40) || "Reimagined",
 		prompt,
-		result: gen,
+		opClass: "reimagine",
+		model: edited.model,
+		fidelity: score?.r ?? null,
+	});
+}
+
+/** Text-to-image into an album; `source` is optional. */
+export async function runGenerateJob(
+	env: Env,
+	userId: string,
+	albumId: string,
+	prompt: string,
+	aspect: string | undefined,
+	source: ImageRow | null,
+): Promise<JobResult> {
+	const gen = await getProvider(env).textToImage(prompt, { aspect });
+	return store(env, userId, albumId, source, gen, {
+		operation: "generate",
+		label: prompt.slice(0, 48) || "Generated image",
+		prompt,
+		opClass: "generate",
+		model: isMock(env) ? "mock:t2i" : env.MODEL_T2I,
+		fidelity: null,
 	});
 }
