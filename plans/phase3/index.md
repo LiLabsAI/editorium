@@ -193,3 +193,25 @@ Open vocabulary — not limited to COCO classes.
 - Moondream `detect` would be the ideal box source when the platform bug is
   fixed — retest periodically. Until then: DETR (boxes) + GLM (labels) +
   Moondream query (discovery, when re-enabled) is the architecture.
+
+
+## Phase 3 addendum: Pruna P-Image-Edit + honest limitations (2026-09-22)
+
+**What works now:**
+- Pruna P-Image-Edit (primary whole-photo edit): generates a new image
+  following your instruction, using the input as reference. Verified live.
+- SDXL-lightning img2img (fallback): also works via multipart.
+- Client pixel transforms (B&W, golden hour): instant, deterministic.
+
+**Honest limitation:** ALL generative image models on Workers AI re-render
+the scene rather than doing pixel-local inpainting. Pruna P-Image-Edit is
+the closest to a true editor but still generates a new interpretation.
+For pixel-exact region editing, the options are: (a) external provider
+with SAM+inpainting pipeline, or (b) accept the generative nature of the
+current models — which is how all modern AI photo editors (Photoshop
+Generative Fill, Canva Magic Edit) actually work: they re-render but
+aim to preserve composition.
+
+**For the user:** Pruna credentials need to be added in the Cloudflare
+dashboard (AI → Providers → Pruna AI). The code is ready; it will
+automatically use Pruna when credentials are present.

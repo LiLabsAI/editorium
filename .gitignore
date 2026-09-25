@@ -205,3 +205,6 @@ rps.jpg
 
 # real-model probe outputs (pnpm probe:models)
 .probe/
+
+# Claude Code: personal, machine-local settings
+.claude/settings.local.json
