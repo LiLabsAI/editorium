@@ -148,7 +148,7 @@ export async function runEnhanceJob(env: Env, userId: string, source: ImageRow):
 		label: "Enhanced",
 		opClass: "enhance",
 		model: out.model,
-		fidelity: score?.r ?? null,
+		fidelity: score?.fidelity ?? null,
 	});
 }
 
@@ -164,7 +164,7 @@ export async function runRemoveBackgroundJob(env: Env, userId: string, source: I
 		label: "Background removed",
 		opClass: "segment",
 		model: isMock(env) ? "mock:segment" : "images:segment-foreground",
-		fidelity: score?.r ?? null,
+		fidelity: score?.fidelity ?? null,
 	});
 }
 
@@ -241,7 +241,7 @@ export async function runLocalEdit(
 		prompt: regions.map((r) => r.text).join("; "),
 		opClass: "local",
 		model,
-		fidelity: score?.r ?? null,
+		fidelity: score?.fidelity ?? null,
 	});
 }
 
@@ -330,7 +330,7 @@ export async function runWholePhotoEdit(
 				prompt,
 				opClass: "reimagine",
 				model: env.MODEL_EDIT_PRIMARY,
-				fidelity: score?.r ?? null,
+				fidelity: score?.fidelity ?? null,
 			});
 		}
 	}
@@ -349,7 +349,7 @@ export async function runWholePhotoEdit(
 		prompt,
 		opClass: "reimagine",
 		model: edited.model,
-		fidelity: score?.r ?? null,
+		fidelity: score?.fidelity ?? null,
 	});
 }
 

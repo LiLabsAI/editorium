@@ -94,6 +94,31 @@ describe("fidelity guard", () => {
 		).rejects.toThrow(/fidelity_check_failed/);
 	});
 
+	it("accepts a faithful large recolour that brightness alone would reject (white shirt → green)", async () => {
+		// A portrait-like frame where a white "shirt" covers the lower half.
+		const draw = async (shirt: [number, number, number]) => {
+			const w = 64;
+			const h = 64;
+			const px = new Uint8Array(w * h * 3);
+			for (let y = 0; y < h; y++) {
+				for (let x = 0; x < w; x++) {
+					let c: [number, number, number] = [150 + y, 140 + y, 130 + y]; // wall
+					if ((x - 32) ** 2 + (y - 18) ** 2 < 100) c = [200, 150, 120]; // face
+					if (y > 30 && x > 8 && x < 56) c = shirt;
+					if (y > 40 && y < 54 && x > 26 && x < 38) c = [30, 90, 200]; // logo
+					px.set(c, (y * w + x) * 3);
+				}
+			}
+			return encodePng(w, h, 3, px);
+		};
+		const source = await draw([245, 245, 245]);
+		const recoloured = await draw([40, 140, 60]);
+		const score = (await assertFidelity(ops, "reimagine", source, recoloured))!;
+		expect(score.r).toBeLessThan(0.4); // the old luma-only check rejected this
+		expect(score.structure).toBeGreaterThanOrEqual(0.3);
+		expect(score.fidelity).toBe(score.structure);
+	});
+
 	it("similarity separates structure from noise", async () => {
 		const a = await decodePng(await pngBytes(32, 32));
 		expect(similarity(a, a).r).toBe(1);

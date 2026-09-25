@@ -92,7 +92,20 @@ await check("reimagine (FLUX with the photo)", async () => {
 	const edited = await provider.editWithReference(reference, "Make it look like golden hour. Keep the composition the same.", editDims(width, height));
 	save("reimagine.png", edited.data);
 	const s = await assertFidelity(ops, "reimagine", working.bytes, edited.data);
-	return `r=${s!.r}`;
+	return `luma r=${s!.r}, structure=${s!.structure}`;
+});
+
+await check("reimagine a large recolour (must pass on structure)", async () => {
+	const ref = referenceDims(width, height);
+	const reference = await ops.resize(working.bytes, ref.width, ref.height);
+	const edited = await provider.editWithReference(
+		reference,
+		"Make the sky dark purple at night. Keep the people, composition, framing and lighting the same.",
+		editDims(width, height),
+	);
+	save("reimagine-recolour.png", edited.data);
+	const s = await assertFidelity(ops, "reimagine", working.bytes, edited.data);
+	return `luma r=${s!.r}, structure=${s!.structure}`;
 });
 
 await check("negative control: text-only FLUX must FAIL the guard", async () => {
@@ -110,7 +123,7 @@ await check("negative control: text-only FLUX must FAIL the guard", async () => 
 	save("negative-control.png", outImg.data);
 	try {
 		const s = await assertFidelity(ops, "reimagine", working.bytes, outImg.data);
-		throw new Error(`guard did NOT catch an input-less generation (r=${s!.r})`);
+		throw new Error(`guard did NOT catch an input-less generation (r=${s!.r}, structure=${s!.structure})`);
 	} catch (error) {
 		if (error instanceof Error && error.message.startsWith("fidelity_check_failed")) return "correctly rejected";
 		throw error;

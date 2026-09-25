@@ -86,3 +86,15 @@ FLUX.2 quality with a 512 px reference? SD 1.5 inpainting quality at photo scale
       model / fidelity` audit (migration 0006).
 - [x] P3 — free-text edits are "Reimagine" (UI copy + chat narration); Pruna
       stays primary and is guarded, pending AI Gateway credits.
+
+## Calibration update (2026-09-25, user report)
+
+A faithful Reimagine ("change the shirt color to green") was rejected: the
+white shirt covers ~45% of the frame, so recolouring it dropped luma r to
+0.37 (< 0.4). Reproduced with the production code on the same photo; the
+output kept the person, pose, drink and background. A day→night recolour
+also tripped the brightness cap (mad 114). Fix: Reimagine now passes on
+**luma r ≥ 0.4 OR structure (edge-map correlation) ≥ 0.3**, with no
+brightness cap. Measured: faithful recolours structure 0.56–0.82; the
+no-photo control −0.05 and an unrelated image 0.14 still fail both.
+`probe:models` now includes a large-recolour case.
