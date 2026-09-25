@@ -183,6 +183,8 @@ export interface NewImage {
 	label: string;
 	filenameLabel?: string;
 	sourceImageId?: string | null;
+	/** Photo family (phase 5); defaults to the new image itself (a root). */
+	rootImageId?: string | null;
 	operation: string;
 	prompt?: string;
 	/** Dimensions reported by a model; only used if the bytes can't be probed. */
@@ -243,6 +245,7 @@ export async function createImageFromBytes(
 				heightPx: dims.height,
 				sizeBytes: opts.bytes.byteLength,
 				sourceImageId: opts.sourceImageId ?? null,
+				rootImageId: opts.rootImageId ?? imageId,
 				currentVersionId: versionId,
 				filenameLabel: (opts.filenameLabel ?? shortLabel(opts.label)).slice(0, 80),
 				segmentStatus: "none",
@@ -289,6 +292,7 @@ export async function storeOperationResult(
 		kind: opts.operation === "generate" ? "generated" : "edited",
 		label: opts.label,
 		sourceImageId: opts.source?.id ?? null,
+		rootImageId: opts.source ? (opts.source.rootImageId ?? opts.source.id) : null,
 		operation: opts.operation,
 		prompt: opts.prompt,
 		fallbackDims: { width: opts.result.width, height: opts.result.height },

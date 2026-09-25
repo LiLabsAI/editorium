@@ -11,6 +11,7 @@ import {
 	type User,
 } from "../../database/schema";
 import { createDb } from "./lib/db";
+import { familyRoot, type OpClass } from "./lib/history";
 import { chargeCredits, createJob, CREDIT_COSTS, enqueueJob } from "./lib/jobs";
 import { loadModelInput } from "./lib/operations";
 import { getProvider } from "./lib/providers";
@@ -35,6 +36,8 @@ export interface AgentInput {
 	text: string;
 	/** Worker origin, needed for the signed URL the primary edit model fetches. */
 	origin: string;
+	/** Set when chatting from the editor: the photo family's history thread. */
+	rootImageId?: string | null;
 	attachedImageId?: string;
 	segmentId?: string;
 	mentionImageIds?: string[];
@@ -189,31 +192,38 @@ export function streamAgentResponse(env: Env, input: AgentInput): ReadableStream
 				}
 
 				const history = await recentHistory(env, input.threadId);
+				// Phase 5: tag both sides of the turn so it appears in the photo
+				// family's editor history (whichever thread it was sent from).
+				const meta = {
+					imageId: decision.targetImage?.id ?? null,
+					rootImageId: input.rootImageId ?? (decision.targetImage ? familyRoot(decision.targetImage) : null),
+					opClass: opClassOf(decision, !!segment),
+				};
+				const userMsgId = crypto.randomUUID();
 				await db.insert(chatMessages).values({
-					id: crypto.randomUUID(),
+					...meta,
+					id: userMsgId,
 					threadId: input.threadId,
 					role: "user",
 					text: input.text,
 					attachedImageId: target && input.attachedImageId === target.id ? target.id : null,
 					segmentId: segment?.id,
+					bboxJson: segment
+						? JSON.stringify([{ x: segment.bboxX, y: segment.bboxY, w: segment.bboxW, h: segment.bboxH }])
+						: null,
 					mentionImageIds: mentionIds.join(",") || null,
 					attachedPaletteIds: paletteIds.join(",") || null,
 				});
 				await titleThread(env, input.threadId, input.text);
 
 				const assistantId = crypto.randomUUID();
+				const reply = { ...meta, id: assistantId, threadId: input.threadId, role: "assistant" as const, replyToId: userMsgId };
 
 				if (decision.operation === "describe" && decision.targetImage) {
 					const { bytes, mime } = await loadModelInput(env, decision.targetImage);
 					const { caption } = await getProvider(env).captionRegion(bytes, mime, "scene", "in the frame");
 					send("token", { value: caption });
-					await db.insert(chatMessages).values({
-						id: assistantId,
-						threadId: input.threadId,
-						role: "assistant",
-						text: caption,
-						operation: "describe",
-					});
+					await db.insert(chatMessages).values({ ...reply, text: caption, operation: "describe" });
 					send("done", { assistantId });
 					return;
 				}
@@ -224,13 +234,7 @@ export function streamAgentResponse(env: Env, input: AgentInput): ReadableStream
 						[{ role: "system", content: SYSTEM_PROMPT }, ...history, { role: "user", content: input.text }],
 						send,
 					);
-					await db.insert(chatMessages).values({
-						id: assistantId,
-						threadId: input.threadId,
-						role: "assistant",
-						text: collected.trim(),
-						operation: "answer",
-					});
+					await db.insert(chatMessages).values({ ...reply, text: collected.trim(), operation: "answer" });
 					send("done", { assistantId });
 					return;
 				}
@@ -248,18 +252,15 @@ export function streamAgentResponse(env: Env, input: AgentInput): ReadableStream
 				const charge = await chargeCredits(db, input.user.id, CREDIT_COSTS[jobType], jobType, jobId);
 				if (!charge.ok) {
 					await db.delete(jobs).where(eq(jobs.id, jobId));
+					await db.insert(chatMessages).values({ ...reply, text: "You're out of credits.", operation: "answer" });
 					send("error", { code: "insufficient_credits", balance: charge.balance });
 					send("done", {});
 					return;
 				}
-				await db.insert(chatMessages).values({
-					id: assistantId,
-					threadId: input.threadId,
-					role: "assistant",
-					text: decision.narration,
-					operation: decision.operation,
-					jobId,
-				});
+				await db.batch([
+					db.update(chatMessages).set({ jobId }).where(eq(chatMessages.id, userMsgId)),
+					db.insert(chatMessages).values({ ...reply, text: decision.narration, operation: decision.operation, jobId }),
+				]);
 				const message: AiJobMessage = {
 					jobId,
 					type: jobType,
@@ -291,6 +292,21 @@ export function streamAgentResponse(env: Env, input: AgentInput): ReadableStream
 			}
 		},
 	});
+}
+
+function opClassOf(decision: AgentDecision, hasRegion: boolean): OpClass {
+	switch (decision.job?.type) {
+		case "generate":
+			return "generate";
+		case "enhance":
+			return "enhance";
+		case "remove_bg":
+			return "segment";
+		case "inpaint":
+			return hasRegion ? "local" : "reimagine";
+		default:
+			return "answer";
+	}
 }
 
 async function streamTokens(

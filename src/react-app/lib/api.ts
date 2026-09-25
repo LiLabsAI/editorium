@@ -65,6 +65,8 @@ export interface ThreadDto {
 	id: string;
 	albumId: string;
 	title: string;
+	/** Set for a photo family's editor history (phase 5). */
+	rootImageId: string | null;
 	createdAt: string;
 }
 
@@ -88,6 +90,32 @@ export interface JobDto {
 	error: string | null;
 	imageId: string | null;
 	resultImageId: string | null;
+}
+
+export type OpClass = "adjust" | "enhance" | "segment" | "local" | "reimagine" | "generate" | "answer" | "upload";
+export type Box = { x: number; y: number; w: number; h: number };
+
+/** One request and its reply in a photo family's history (server-derived). */
+export interface HistoryTurn {
+	id: string;
+	createdAt: string;
+	derived: boolean;
+	request: { text: string; opClass: OpClass | null; bboxes: Box[]; imageId: string | null };
+	reply: {
+		status: "queued" | "running" | "done" | "error";
+		text: string;
+		error: string | null;
+		credits: number;
+		refunded: boolean;
+		result: {
+			imageId: string;
+			label: string;
+			opClass: string | null;
+			model: string | null;
+			fidelity: number | null;
+			exists: boolean;
+		} | null;
+	};
 }
 
 export interface PaletteDto {
@@ -236,6 +264,9 @@ export const api = {
 
 	job: (id: string) => request<{ job: JobDto }>(`/jobs/${id}`),
 
+	/** Photo-family timeline + its chat thread (phase 5). */
+	history: (imageId: string) =>
+		request<{ threadId: string; rootImageId: string; turns: HistoryTurn[] }>(`/images/${imageId}/history`),
 	branchFamily: (imageId: string) =>
 		request<{ images: ImageDto[] }>(`/images/${imageId}/branch`),
 	filterBranch: async (imageId: string, label: string, blob: Blob) => {
@@ -339,6 +370,38 @@ export function fileUrl(
 ): string {
 	const v = versionId ? `&v=${versionId}` : "";
 	return `/api/images/${imageId}/file?variant=${variant}${v}`;
+}
+
+/** Read the agent's SSE stream (`data: {event, data}` frames), calling
+ * `onFrame` per frame; malformed frames are skipped. */
+export async function readAgentStream(
+	res: Response,
+	onFrame: (event: string, data: Record<string, unknown>) => void,
+): Promise<void> {
+	if (!res.ok || !res.body) {
+		const detail = (await res.json().catch(() => ({}))) as { error?: string };
+		throw new ApiError(detail.error ?? "error", res.status);
+	}
+	const reader = res.body.getReader();
+	const decoder = new TextDecoder();
+	let buffer = "";
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		buffer += decoder.decode(value, { stream: true });
+		const parts = buffer.split("\n\n");
+		buffer = parts.pop() ?? "";
+		for (const part of parts) {
+			const line = part.trim();
+			if (!line.startsWith("data:")) continue;
+			try {
+				const frame = JSON.parse(line.slice(5).trim()) as { event: string; data: Record<string, unknown> };
+				onFrame(frame.event, frame.data ?? {});
+			} catch {
+				// skip a malformed frame
+			}
+		}
+	}
 }
 
 /** Public share media, addressed by TOKEN (an image id grants nothing). */

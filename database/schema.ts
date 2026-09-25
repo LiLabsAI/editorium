@@ -82,6 +82,9 @@ export const images = sqliteTable(
 		heightPx: integer("height_px").notNull().default(0),
 		sizeBytes: integer("size_bytes").notNull().default(0),
 		sourceImageId: text("source_image_id"),
+		/** Original upload this photo descends from (itself for roots). One
+		 * editor history ("photo family") per root — phase 5. */
+		rootImageId: text("root_image_id"),
 		currentVersionId: text("current_version_id"),
 		filenameLabel: text("filename_label").notNull(),
 		bookmarkedAt: integer("bookmarked_at", { mode: "timestamp_ms" }),
@@ -103,6 +106,7 @@ export const images = sqliteTable(
 		}).onDelete("set null"),
 		index("images_album_idx").on(t.albumId, t.positionIdx),
 		index("images_source_idx").on(t.sourceImageId),
+		index("images_root_idx").on(t.rootImageId),
 	],
 );
 
@@ -183,11 +187,16 @@ export const chatThreads = sqliteTable(
 		.notNull()
 		.references(() => albums.id, { onDelete: "cascade" }),
 	title: text("title").notNull().default("New chat"),
+	/** Set for a photo family's editor history; null for album chats. */
+	rootImageId: text("root_image_id"),
 	createdAt: integer("created_at", { mode: "timestamp_ms" })
 		.notNull()
 		.default(now),
 	},
-	(t) => [index("chat_threads_album_idx").on(t.albumId)],
+	(t) => [
+		index("chat_threads_album_idx").on(t.albumId),
+		uniqueIndex("chat_threads_family_unique").on(t.albumId, t.rootImageId),
+	],
 );
 
 export const chatMessages = sqliteTable(
@@ -209,11 +218,21 @@ export const chatMessages = sqliteTable(
 		enum: ["answer", "generate", "enhance", "edit", "describe"],
 	}),
 	jobId: text("job_id"),
+	/** Phase 5 history: the photo acted on, its family, the operation class,
+	 * the region(s) as JSON [{x,y,w,h}], and (assistant) the request answered. */
+	imageId: text("image_id"),
+	rootImageId: text("root_image_id"),
+	opClass: text("op_class"),
+	bboxJson: text("bbox_json"),
+	replyToId: text("reply_to_id"),
 	createdAt: integer("created_at", { mode: "timestamp_ms" })
 		.notNull()
 		.default(now),
 	},
-	(t) => [index("chat_messages_thread_idx").on(t.threadId, t.createdAt)],
+	(t) => [
+		index("chat_messages_thread_idx").on(t.threadId, t.createdAt),
+		index("chat_messages_root_idx").on(t.rootImageId, t.createdAt),
+	],
 );
 
 export const editInstructions = sqliteTable(

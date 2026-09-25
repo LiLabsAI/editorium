@@ -41,16 +41,19 @@ export function AlbumPage({ projectName }: { projectName: string }) {
 		]);
 		setImages(imgsRes.images);
 		setThreads(threadsRes.threads);
-		if (threadsRes.threads.length > 0 && !threadId) {
-			setThreadId(threadsRes.threads[0]!.id);
-		} else if (threadsRes.threads.length === 0) {
+		// Default to an album chat; photo histories are listed but belong to the editor.
+		const albumChat = threadsRes.threads.find((t) => !t.rootImageId);
+		if (albumChat && !threadId) {
+			setThreadId(albumChat.id);
+		} else if (!albumChat) {
 			const { thread } = await api.createThread(albumId);
-			setThreads([thread]);
+			setThreads([thread, ...threadsRes.threads]);
 			setThreadId(thread.id);
 		}
 	}, [albumId, threadId]);
 
 	const hasPending = images.some((img) => img.segmentStatus === "pending");
+	const activeThread = threads.find((t) => t.id === threadId);
 
 	useEffect(() => {
 		loadImages();
@@ -255,11 +258,26 @@ export function AlbumPage({ projectName }: { projectName: string }) {
 							onChange={(e) => setThreadId(e.target.value)}
 							className="rounded-full bg-secondary px-3 py-1 text-sm"
 						>
-							{threads.map((t) => (
-								<option key={t.id} value={t.id}>
-									{t.title}
-								</option>
-							))}
+							<optgroup label="Album chats">
+								{threads
+									.filter((t) => !t.rootImageId)
+									.map((t) => (
+										<option key={t.id} value={t.id}>
+											{t.title}
+										</option>
+									))}
+							</optgroup>
+							{threads.some((t) => t.rootImageId) && (
+								<optgroup label="Photo histories">
+									{threads
+										.filter((t) => t.rootImageId)
+										.map((t) => (
+											<option key={t.id} value={t.id}>
+												{images.find((i) => i.id === t.rootImageId)?.filenameLabel ?? "Photo history"}
+											</option>
+										))}
+								</optgroup>
+							)}
 						</select>
 					</div>
 					<div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 pb-4" role="log" aria-live="polite">
@@ -286,7 +304,16 @@ export function AlbumPage({ projectName }: { projectName: string }) {
 						)}
 					</div>
 					<div className="p-4 pt-0">
-						<AskComposer onSend={(text) => send(text)} />
+						{activeThread?.rootImageId ? (
+							<button
+								onClick={() => navigate(`/albums/${albumId}/images/${activeThread.rootImageId}`)}
+								className="w-full rounded-2xl border ed-hairline bg-card px-4 py-3 text-sm transition hover:bg-muted"
+							>
+								Continue this photo's history in the editor →
+							</button>
+						) : (
+							<AskComposer onSend={(text) => send(text)} />
+						)}
 					</div>
 				</aside>
 			</div>

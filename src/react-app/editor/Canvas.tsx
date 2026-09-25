@@ -7,22 +7,32 @@ import { toNorm, type Bbox, type Rect } from "./geometry";
 const FALLBACK = { width: 800, height: 1000 };
 const MIN_ZOOM = 0.05;
 const MAX_ZOOM = 8;
+/** Drags smaller than this (normalized) are clicks: they clear the selection. */
+const MIN_SELECTION = 0.015;
 
 interface Rects {
 	container: Rect;
 	img: Rect;
 }
 
-/** The photo plane: fit/zoom/pan, nothing else. Input math runs through the
- * measured, transform-inclusive image rect (editor/geometry.ts). */
+/**
+ * The photo plane: fit/zoom/pan and region selection. A drawn box is context
+ * only — it is shown in the composer and applied from there (phase 5); the
+ * canvas never asks for text itself. `highlights` outline regions of a
+ * history entry the user is hovering.
+ */
 export function EditorCanvas({
 	image,
-	onRegionEdit,
+	selection,
+	onSelectionChange,
+	highlights = [],
 	sourceUrl,
 }: {
 	image: ImageDto;
-	onRegionEdit?: (rect: { x: number; y: number; w: number; h: number }, text: string) => void;
-	/** Branch source photo URL — enables the before/after wipe (step 2). */
+	selection: Bbox | null;
+	onSelectionChange: (box: Bbox | null) => void;
+	highlights?: Bbox[];
+	/** Branch source photo URL — enables the before/after wipe. */
 	sourceUrl?: string;
 }) {
 	const editor = useEditorState();
@@ -33,10 +43,7 @@ export function EditorCanvas({
 		img: { left: 0, top: 0, width: 0, height: 0 },
 	});
 	const [imgRect, setImgRect] = useState<Rect>({ left: 0, top: 0, width: 0, height: 0 });
-	const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
-	const panning = useRef(false);
-	const [rect, setRect] = useState<Bbox | null>(null);
-	const [text, setText] = useState("");
+	const [draft, setDraft] = useState<Bbox | null>(null);
 	const [compare, setCompare] = useState(false);
 	const [wipe, setWipe] = useState(50);
 	const drawing = useRef<{ x: number; y: number } | null>(null);
@@ -52,11 +59,7 @@ export function EditorCanvas({
 			const r = el.getBoundingClientRect();
 			const c = container.getBoundingClientRect();
 			const img = { left: r.left - c.left, top: r.top - c.top, width: r.width, height: r.height };
-			const cont = { left: c.left, top: c.top, width: c.width, height: c.height };
-			rectsRef.current = { container: cont, img };
-			setContainerSize((prev) =>
-				prev.width === c.width && prev.height === c.height ? prev : { width: c.width, height: c.height },
-			);
+			rectsRef.current = { container: { left: c.left, top: c.top, width: c.width, height: c.height }, img };
 			setImgRect((prev) =>
 				prev.left === img.left && prev.top === img.top && prev.width === img.width && prev.height === img.height
 					? prev
@@ -77,11 +80,7 @@ export function EditorCanvas({
 		const container = containerRef.current;
 		if (!container) return;
 		const scale = Math.max(
-			Math.min(
-				(container.clientWidth - 96) / naturalWidth,
-				(container.clientHeight - 96) / naturalHeight,
-				1,
-			),
+			Math.min((container.clientWidth - 96) / naturalWidth, (container.clientHeight - 96) / naturalHeight, 1),
 			MIN_ZOOM,
 		);
 		editorStore.set({
@@ -95,9 +94,8 @@ export function EditorCanvas({
 
 	useEffect(() => {
 		fit();
-		const onResize = () => fit();
-		window.addEventListener("resize", onResize);
-		return () => window.removeEventListener("resize", onResize);
+		window.addEventListener("resize", fit);
+		return () => window.removeEventListener("resize", fit);
 	}, [fit]);
 
 	// Wheel zoom anchored at the cursor.
@@ -110,9 +108,8 @@ export function EditorCanvas({
 			if (img.width <= 0) return;
 			const nx = (e.clientX - cont.left - img.left) / img.width;
 			const ny = (e.clientY - cont.top - img.top) / img.height;
-			const current = editorStore.get();
 			const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
-			const zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, current.zoom * factor));
+			const zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, editorStore.get().zoom * factor));
 			editorStore.set({
 				zoom,
 				offset: {
@@ -125,18 +122,22 @@ export function EditorCanvas({
 		return () => container.removeEventListener("wheel", onWheel);
 	}, [naturalWidth, naturalHeight]);
 
-	// Left drag = draw an edit region. Alt/middle drag = pan.
+	/** Pointer → normalized image space, clamped to the photo. */
+	function normFromClient(clientX: number, clientY: number) {
+		const pt = toNorm(clientX, clientY, rectsRef.current.container, rectsRef.current.img);
+		if (!pt) return null;
+		const clamp = (v: number) => Math.min(1, Math.max(0, v));
+		return { x: clamp(pt.x), y: clamp(pt.y) };
+	}
+
+	// Left drag = select a region. Alt / middle / right drag = pan.
 	const onPointerDown = (e: React.PointerEvent) => {
 		if (e.button !== 0 || e.altKey) {
 			(e.currentTarget as Element).setPointerCapture?.(e.pointerId);
-			panning.current = true;
 			const start = { x: e.clientX, y: e.clientY, ox: editorStore.get().offset.x, oy: editorStore.get().offset.y };
-			const move = (ev: PointerEvent) => {
-				if (!panning.current) return;
+			const move = (ev: PointerEvent) =>
 				editorStore.set({ offset: { x: start.ox + (ev.clientX - start.x), y: start.oy + (ev.clientY - start.y) } });
-			};
 			const up = () => {
-				panning.current = false;
 				window.removeEventListener("pointermove", move);
 				window.removeEventListener("pointerup", up);
 			};
@@ -148,23 +149,14 @@ export function EditorCanvas({
 		if (!pt) return;
 		(e.currentTarget as Element).setPointerCapture?.(e.pointerId);
 		drawing.current = pt;
-		setRect({ x: pt.x, y: pt.y, w: 0.005, h: 0.005 });
+		setDraft({ x: pt.x, y: pt.y, w: 0, h: 0 });
 	};
 
-	/** Pointer → normalized image space, clamped to the photo so a drag past
-	 * the edge still yields a valid 0..1 region. */
-	function normFromClient(clientX: number, clientY: number) {
-		const pt = toNorm(clientX, clientY, rectsRef.current.container, rectsRef.current.img);
-		if (!pt) return null;
-		const clamp = (v: number) => Math.min(1, Math.max(0, v));
-		return { x: clamp(pt.x), y: clamp(pt.y) };
-	}
-
-	const onRegionPointerMove = (e: React.PointerEvent) => {
+	const onPointerMove = (e: React.PointerEvent) => {
 		if (!drawing.current) return;
 		const pt = normFromClient(e.clientX, e.clientY);
 		if (!pt) return;
-		setRect({
+		setDraft({
 			x: Math.min(drawing.current.x, pt.x),
 			y: Math.min(drawing.current.y, pt.y),
 			w: Math.abs(pt.x - drawing.current.x),
@@ -172,30 +164,27 @@ export function EditorCanvas({
 		});
 	};
 
-	const onRegionPointerUp = () => {
+	const onPointerUp = () => {
 		if (!drawing.current) return;
 		drawing.current = null;
-		setRect((r) => (r && r.w > 0.015 && r.h > 0.015 ? r : null));
+		onSelectionChange(draft && draft.w > MIN_SELECTION && draft.h > MIN_SELECTION ? draft : null);
+		setDraft(null);
 	};
-
-	async function submitRegion() {
-		if (!rect || !text.trim()) return;
-		onRegionEdit?.(rect, text.trim());
-		setRect(null);
-		setText("");
-	}
 
 	useEffect(() => {
 		const onKey = (e: KeyboardEvent) => {
 			const target = e.target as HTMLElement;
 			if (target.tagName === "TEXTAREA" || target.tagName === "INPUT") return;
+			if (e.key === "Escape") onSelectionChange(null);
 			if (e.key === "0") fit();
 			if (e.key === "+" || e.key === "=") editorStore.set({ zoom: Math.min(MAX_ZOOM, editorStore.get().zoom * 1.2) });
 			if (e.key === "-") editorStore.set({ zoom: Math.max(MIN_ZOOM, editorStore.get().zoom / 1.2) });
 		};
 		window.addEventListener("keydown", onKey);
 		return () => window.removeEventListener("keydown", onKey);
-	}, [fit]);
+	}, [fit, onSelectionChange]);
+
+	const shown = draft ?? selection;
 
 	return (
 		<div
@@ -203,10 +192,10 @@ export function EditorCanvas({
 			className="ed-canvas-bg relative min-h-0 flex-1 select-none overflow-hidden"
 			style={{ cursor: "crosshair", touchAction: "none" }}
 			onPointerDown={onPointerDown}
-			onPointerMove={onRegionPointerMove}
-			onPointerUp={onRegionPointerUp}
+			onPointerMove={onPointerMove}
+			onPointerUp={onPointerUp}
 			role="application"
-			aria-label="Photo viewer"
+			aria-label="Photo viewer. Drag to select a region."
 		>
 			<div
 				style={{
@@ -215,25 +204,6 @@ export function EditorCanvas({
 					position: "absolute",
 				}}
 			>
-				{rect && (
-					<svg
-						className="pointer-events-none absolute left-0 top-0"
-						style={{ width: naturalWidth, height: naturalHeight }}
-						viewBox="0 0 1 1"
-						preserveAspectRatio="none"
-					>
-						<rect
-							x={rect.x}
-							y={rect.y}
-							width={rect.w}
-							height={rect.h}
-							fill="rgba(99,120,255,0.10)"
-							stroke="rgba(99,120,255,0.9)"
-							strokeWidth={2}
-							vectorEffect="non-scaling-stroke"
-						/>
-					</svg>
-				)}
 				<img
 					ref={imgRef}
 					src={fileUrl(image.id, "web", image.currentVersionId ?? undefined)}
@@ -257,71 +227,48 @@ export function EditorCanvas({
 					/>
 				)}
 				{compare && sourceUrl && (
-					<div
-						className="pointer-events-none absolute top-0 h-full w-0.5 bg-white shadow"
-						style={{ left: `${wipe}%` }}
-					/>
+					<div className="pointer-events-none absolute top-0 h-full w-0.5 bg-white shadow" style={{ left: `${wipe}%` }} />
+				)}
+				{(shown || highlights.length > 0) && (
+					<svg
+						className="pointer-events-none absolute left-0 top-0"
+						style={{ width: naturalWidth, height: naturalHeight }}
+						viewBox="0 0 1 1"
+						preserveAspectRatio="none"
+						aria-hidden
+					>
+						{highlights.map((h, i) => (
+							<rect
+								key={i}
+								x={h.x}
+								y={h.y}
+								width={h.w}
+								height={h.h}
+								fill="rgba(255,196,64,0.16)"
+								stroke="rgba(255,196,64,1)"
+								strokeWidth={3}
+								strokeDasharray="8 5"
+								vectorEffect="non-scaling-stroke"
+							/>
+						))}
+						{shown && (
+							<rect
+								x={shown.x}
+								y={shown.y}
+								width={shown.w}
+								height={shown.h}
+								fill="rgba(99,120,255,0.10)"
+								stroke="rgba(99,120,255,0.95)"
+								strokeWidth={2}
+								vectorEffect="non-scaling-stroke"
+							/>
+						)}
+					</svg>
 				)}
 			</div>
-			{/* Describe input at the drawn region */}
-			{rect && (
-				<div
-					className="absolute z-20 w-72 rounded-xl border ed-hairline bg-card p-2 shadow-2xl"
-					style={{
-						// Anchor at the selection's bottom-right, clamped to the
-						// visible container (not the possibly-zoomed image).
-						left: Math.max(8, Math.min((rect.x + rect.w) * imgRect.width + imgRect.left, containerSize.width - 296)),
-						top: Math.max(8, Math.min((rect.y + rect.h) * imgRect.height + imgRect.top + 8, containerSize.height - 140)),
-					}}
-					onPointerDown={(e) => e.stopPropagation()}
-				>
-					<textarea
-						autoFocus
-						rows={2}
-						value={text}
-						placeholder="Describe edits"
-						aria-label="Describe edits"
-						onChange={(e) => setText(e.target.value)}
-						onKeyDown={(e) => {
-							if (e.key === "Enter" && !e.shiftKey) {
-								e.preventDefault();
-								submitRegion();
-							}
-							if (e.key === "Escape") {
-								setRect(null);
-								setText("");
-							}
-						}}
-						className="w-full resize-none bg-transparent px-1 text-sm outline-none placeholder:text-muted-foreground"
-					/>
-					<div className="flex items-center justify-end gap-1.5 pt-1">
-						<button
-							aria-label="Cancel region edit"
-							onClick={() => {
-								setRect(null);
-								setText("");
-							}}
-							className="rounded-lg px-2 py-1 text-xs text-muted-foreground hover:bg-muted"
-						>
-							Cancel
-						</button>
-						<button
-							aria-label="Apply region edit"
-							title="Apply"
-							disabled={!text.trim()}
-							onClick={submitRegion}
-							className="flex size-7 items-center justify-center rounded-full bg-foreground text-background disabled:opacity-30"
-						>
-							↑
-						</button>
-					</div>
-				</div>
-			)}
 			{sourceUrl && (
 				<div
 					className="absolute bottom-4 right-4 flex items-center gap-2 rounded-full bg-black/65 px-3 py-1.5"
-					// Controls sit over the canvas: don't let a click here start
-					// a region draw (pointer capture would swallow the click).
 					onPointerDown={(e) => e.stopPropagation()}
 				>
 					<button
@@ -347,7 +294,7 @@ export function EditorCanvas({
 				</div>
 			)}
 			<div className="pointer-events-none absolute bottom-4 left-4 rounded-full bg-black/55 px-2.5 py-1 text-xs text-white/85">
-				{Math.round(editor.zoom * 100)}% · drag to select a region · scroll to zoom · Alt+drag to pan
+				{Math.round(editor.zoom * 100)}% · drag to select a region · Esc clears · scroll to zoom · Alt+drag to pan
 			</div>
 			{imgRect.width === 0 && (
 				<div className="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">

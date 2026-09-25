@@ -40,6 +40,7 @@ import {
 import { getProvider, isMock } from "../lib/providers";
 import { albumPrefix, deletePrefix, getObject, legacyAlbumPrefix, mediaKeys, putObject, sniffMime } from "../lib/r2";
 import { verifyPublicImageUrl } from "../lib/sign";
+import { ensureFamilyThread, familyHistory, recordAction, type Box, type OpClass } from "../lib/history";
 import type { AiJobMessage } from "../queue";
 import { auth } from "./auth";
 
@@ -133,13 +134,15 @@ function background(c: Ctx, work: Promise<unknown>): void {
 	}
 }
 
-/** Create a job, charge it atomically, enqueue it. Refuses (402) without credit. */
+/** Create a job, charge it atomically, record it in the photo's history
+ * (phase 5), enqueue it. Refuses (402) without credit. */
 async function startJob(
 	c: Ctx,
 	userId: string,
 	type: Exclude<JobType, "caption" | "thumb">,
 	message: Omit<AiJobMessage, "jobId" | "type" | "userId">,
 	payload?: Record<string, unknown>,
+	history?: { image: ImageRow; text: string; opClass: OpClass; bboxes?: Box[] },
 ): Promise<string> {
 	await requireAiQuota(c.env, userId);
 	const db = createDb(c.env.DB);
@@ -155,7 +158,8 @@ async function startJob(
 		await db.delete(jobs).where(eq(jobs.id, jobId));
 		fail(402, "insufficient_credits");
 	}
-	const body: AiJobMessage = { ...message, jobId, type, userId };
+	const recorded = history ? await recordAction(db, { ...history, jobId }) : null;
+	const body: AiJobMessage = { ...message, jobId, type, userId, chatMessageId: recorded?.replyId };
 	await enqueueJob(c.env.AI_JOBS, jobId, type, { ...body });
 	return jobId;
 }
@@ -462,9 +466,12 @@ api.post("/images/:id/filter-branch", async (c) => {
 		kind: "edited",
 		label,
 		sourceImageId: row.image.id,
+		rootImageId: row.image.rootImageId ?? row.image.id,
 		operation: "filter",
 		audit: { opClass: "adjust", model: "client:canvas" },
 	});
+	// Instant operation: recorded already finished.
+	await recordAction(createDb(c.env.DB), { image: row.image, text: label, opClass: "adjust", resultImageId: imageId });
 	return c.json({ imageId, versionId }, 201);
 });
 
@@ -485,6 +492,7 @@ api.post("/images/:id/edit", async (c) => {
 		"inpaint",
 		{ imageId: row.image.id, prompt, origin: origin(c) },
 		{ prompt },
+		{ image: row.image, text: prompt, opClass: "reimagine" },
 	);
 	return c.json({ jobId }, 202);
 });
@@ -506,6 +514,12 @@ api.post("/images/:id/edit-region", async (c) => {
 		"inpaint",
 		{ imageId: row.image.id, segmentId: owned.segment.id, prompt },
 		{ prompt },
+		{
+			image: row.image,
+			text: prompt,
+			opClass: "local",
+			bboxes: [{ x: owned.segment.bboxX, y: owned.segment.bboxY, w: owned.segment.bboxW, h: owned.segment.bboxH }],
+		},
 	);
 	return c.json({ jobId }, 202);
 });
@@ -513,7 +527,11 @@ api.post("/images/:id/edit-region", async (c) => {
 api.post("/images/:id/enhance", async (c) => {
 	const user = await requireUser(c);
 	const row = await requireImage(c, user.id);
-	const jobId = await startJob(c, user.id, "enhance", { imageId: row.image.id });
+	const jobId = await startJob(c, user.id, "enhance", { imageId: row.image.id }, undefined, {
+		image: row.image,
+		text: "Enhance",
+		opClass: "enhance",
+	});
 	return c.json({ jobId }, 202);
 });
 
@@ -521,7 +539,11 @@ api.post("/images/:id/enhance", async (c) => {
 api.post("/images/:id/remove-background", async (c) => {
 	const user = await requireUser(c);
 	const row = await requireImage(c, user.id);
-	const jobId = await startJob(c, user.id, "remove_bg", { imageId: row.image.id });
+	const jobId = await startJob(c, user.id, "remove_bg", { imageId: row.image.id }, undefined, {
+		image: row.image,
+		text: "Remove background",
+		opClass: "segment",
+	});
 	return c.json({ jobId }, 202);
 });
 
@@ -775,7 +797,7 @@ api.post("/albums/:id/threads", async (c) => {
 		const [existing] = await db
 			.select()
 			.from(chatThreads)
-			.where(eq(chatThreads.albumId, album.id))
+			.where(and(eq(chatThreads.albumId, album.id), isNull(chatThreads.rootImageId)))
 			.orderBy(desc(chatThreads.createdAt))
 			.limit(1);
 		if (existing) return c.json({ thread: existing, reused: true });
@@ -816,6 +838,7 @@ api.post("/threads/:id/messages", async (c) => {
 		albumId: thread.albumId,
 		user,
 		origin: origin(c),
+		rootImageId: thread.rootImageId,
 		...body,
 	});
 	return new Response(stream, {
@@ -866,9 +889,19 @@ api.post("/images/:id/duplicate", async (c) => {
 		label: "Duplicate",
 		filenameLabel: `${row.image.filenameLabel} copy`,
 		sourceImageId: row.image.sourceImageId,
+		rootImageId: row.image.rootImageId ?? row.image.id,
 		operation: "duplicate",
 	});
 	return c.json({ image }, 201);
+});
+
+// Editor history (phase 5): the photo family's timeline + its chat thread.
+api.get("/images/:id/history", async (c) => {
+	const user = await requireUser(c);
+	const row = await requireImage(c, user.id);
+	const threadId = await ensureFamilyThread(createDb(c.env.DB), row.image);
+	const { rootImageId, turns } = await familyHistory(c.env, row.image);
+	return c.json({ threadId, rootImageId, turns });
 });
 
 // Branch family (plan 24): the source chain plus all branches off it.
@@ -993,6 +1026,12 @@ api.post("/images/:id/apply-instructions", async (c) => {
 		"batch_edit",
 		{ imageId: row.image.id, instructions, instructionIds: pending.map((p) => p.id), label },
 		{ instructions, label },
+		{
+			image: row.image,
+			text: pending.map((p) => p.text).join("; "),
+			opClass: "local",
+			bboxes: instructions.map((i) => i.bbox),
+		},
 	);
 	return c.json({ jobId, label }, 202);
 });
