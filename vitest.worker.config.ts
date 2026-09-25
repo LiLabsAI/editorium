@@ -14,7 +14,15 @@ export default defineConfig({
 
 			return {
 				miniflare: {
-					bindings: { TEST_MIGRATIONS: migrations },
+					bindings: {
+						TEST_MIGRATIONS: migrations,
+						// Never spend real AI usage in tests, and never depend on
+						// a developer's .dev.vars (CI has none).
+						AI_MOCK: "true",
+						AUTH_SECRET: "test-only-secret-0123456789abcdef0123456789abcdef",
+						OWNER_CLAIM_KEY: "test-owner-claim-key",
+						OWNER_USER_ID: "owner-user-for-tests",
+					},
 				},
 				wrangler: { configPath: "./wrangler.json" },
 			};

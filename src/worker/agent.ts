@@ -1,21 +1,30 @@
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 
 import {
 	chatMessages,
 	chatThreads,
 	images,
+	jobs,
+	palettes,
+	segments,
 	type ImageRow,
 	type User,
 } from "../../database/schema";
 import { createDb } from "./lib/db";
-import { chargeCredits, createJob, enqueueJob } from "./lib/jobs";
+import { familyRoot, type OpClass } from "./lib/history";
+import { chargeCredits, createJob, CREDIT_COSTS, enqueueJob } from "./lib/jobs";
+import { loadModelInput } from "./lib/operations";
 import { getProvider } from "./lib/providers";
+import type { AiJobMessage } from "./queue";
 
 /**
  * Chat agent (plan 6): classifies the user's request, narrates while the
  * matching AI operation runs, and links the produced image back into the
  * thread. Tool selection is a deterministic rule router (fast + testable);
  * the LLM shapes the conversational narration when a real provider is bound.
+ *
+ * SSE protocol: every frame is `data: {"event": E, "data": {...}}` where
+ * token frames carry `{ value }`.
  */
 
 export type AgentOperation = "answer" | "generate" | "enhance" | "edit" | "describe";
@@ -25,39 +34,53 @@ export interface AgentInput {
 	albumId: string;
 	user: User;
 	text: string;
+	/** Worker origin, needed for the signed URL the primary edit model fetches. */
+	origin: string;
+	/** Set when chatting from the editor: the photo family's history thread. */
+	rootImageId?: string | null;
 	attachedImageId?: string;
 	segmentId?: string;
 	mentionImageIds?: string[];
 	paletteIds?: string[];
 }
 
+type JobKind = "generate" | "enhance" | "inpaint" | "caption" | "remove_bg";
+
 export interface AgentDecision {
 	operation: AgentOperation;
 	targetImage: ImageRow | null;
 	narration: string;
-	job: {
-		type: "generate" | "enhance" | "inpaint" | "caption";
-		prompt?: string;
-		aspect?: string;
-		strength?: number;
-	} | null;
+	job: { type: JobKind; prompt?: string; aspect?: string } | null;
 }
 
 const QUALITY_RE = /(4k|high[- ]?qualit|sharper|sharpen|resolution|upscale|professional camera|costly camera|better camera|clearer)/i;
 const CREATE_RE = /(generate|create|make me|draw|design|produce) (an? |some )?(image|picture|photo|art|scene)/i;
 const ADD_RE = /(add|put|place) (a|an|the|some)/i;
+const BACKGROUND_RE = /(remove|delete|erase|cut out|get rid of)( the)? (background|backdrop|bg)|transparent background/i;
 const DESCRIBE_RE = /(what|describe|explain|tell me about|what.s in) (this|the|that)? ?(image|photo|picture)?/i;
 
-/** Pick the image the request operates on: attachment, @mention, or latest. */
+/** Chat generations use a fixed landscape aspect. */
+export const CHAT_GENERATE_ASPECT = "4:3";
+
+/**
+ * Pick the image the request operates on: attachment, @mention, or the
+ * album's latest. Explicit ids are honoured ONLY if they belong to this
+ * thread's album (the thread's ownership is checked by the route), so a
+ * caller can never target someone else's photo.
+ */
 export async function resolveTargetImage(
 	env: Env,
 	albumId: string,
-	input: AgentInput,
+	input: Pick<AgentInput, "attachedImageId" | "mentionImageIds">,
 ): Promise<ImageRow | null> {
 	const db = createDb(env.DB);
 	const explicit = input.attachedImageId ?? input.mentionImageIds?.[0];
 	if (explicit) {
-		const [row] = await db.select().from(images).where(eq(images.id, explicit)).limit(1);
+		const [row] = await db
+			.select()
+			.from(images)
+			.where(and(eq(images.id, explicit), eq(images.albumId, albumId)))
+			.limit(1);
 		if (row) return row;
 	}
 	const [latest] = await db
@@ -69,10 +92,7 @@ export async function resolveTargetImage(
 	return latest ?? null;
 }
 
-export function decideOperation(
-	text: string,
-	target: ImageRow | null,
-): AgentDecision {
+export function decideOperation(text: string, target: ImageRow | null): AgentDecision {
 	const wantsEnhance = QUALITY_RE.test(text);
 	const wantsCreate = CREATE_RE.test(text) || (!target && ADD_RE.test(text));
 
@@ -81,262 +101,269 @@ export function decideOperation(
 			operation: "generate",
 			targetImage: null,
 			narration: "Generating a new image from your description.",
-			job: { type: "generate", prompt: text, aspect: "4:3" },
+			job: { type: "generate", prompt: text, aspect: CHAT_GENERATE_ASPECT },
+		};
+	}
+	if (BACKGROUND_RE.test(text) && target) {
+		return {
+			operation: "edit",
+			targetImage: target,
+			narration: "Removing the background — the subject stays exactly as it is.",
+			job: { type: "remove_bg" },
 		};
 	}
 	if (wantsEnhance && target) {
 		return {
 			operation: "enhance",
 			targetImage: target,
-			narration: "I'll enhance this into a crisp, high-quality photograph with the depth and clarity of a professional camera.",
-			job: { type: "enhance", strength: 0.8 },
+			narration: "Enhancing detail and resolution — the photo itself stays the same.",
+			job: { type: "enhance" },
 		};
 	}
 	if (DESCRIBE_RE.test(text) && target) {
-		return {
-			operation: "describe",
-			targetImage: target,
-			narration: "Looking at the image…",
-			job: { type: "caption" },
-		};
+		return { operation: "describe", targetImage: target, narration: "", job: { type: "caption" } };
 	}
 	if (target && ADD_RE.test(text)) {
 		return {
 			operation: "edit",
 			targetImage: target,
-			narration: "Applying that change to the latest image.",
-			job: { type: "inpaint", prompt: text, strength: 0.6 },
+			narration: "Reimagining the photo with that change — AI may alter other details too.",
+			job: { type: "inpaint", prompt: text },
 		};
 	}
-	// Plain instruction + a target image and no selected region: whole-photo
-	// edit (questions still get answers).
-	if (target && text.trim().split(/\s+/).length >= 3 && !/(\?|^(what|where|who|why|how|is|are|can|do|does)\b)/i.test(text.trim())) {
+	// Plain instruction + a target image: whole-photo edit (questions still
+	// get answers).
+	if (
+		target &&
+		text.trim().split(/\s+/).length >= 3 &&
+		!/(\?|^(what|where|who|why|how|is|are|can|do|does)\b)/i.test(text.trim())
+	) {
 		return {
 			operation: "edit",
 			targetImage: target,
-			narration: "Applying that change to the photo.",
-			job: { type: "inpaint", prompt: text, strength: 0.6 },
+			narration: "Reimagining the photo with that change — AI may alter other details too.",
+			job: { type: "inpaint", prompt: text },
 		};
 	}
-	return {
-		operation: "answer",
-		targetImage: target,
-		narration: "",
-		job: null,
-	};
+	return { operation: "answer", targetImage: target, narration: "", job: null };
 }
 
+const SYSTEM_PROMPT =
+	"You are Editorium's assistant inside an AI photo editor. Be brief and concrete. " +
+	"You can generate images, enhance them, and edit photos or selected regions.";
+
 /** Build the SSE-streamed response for one user message. */
-export function streamAgentResponse(
-	env: Env,
-	input: AgentInput,
-): ReadableStream {
+export function streamAgentResponse(env: Env, input: AgentInput): ReadableStream<Uint8Array> {
 	const encoder = new TextEncoder();
-	return new ReadableStream({
+	return new ReadableStream<Uint8Array>({
 		async start(controller) {
-			const send = (event: string, data: unknown) => {
+			const send = (event: string, data: Record<string, unknown>) => {
 				controller.enqueue(encoder.encode(`data: ${JSON.stringify({ event, data })}\n\n`));
 			};
+			const db = createDb(env.DB);
 			try {
-				const db = createDb(env.DB);
 				const target = await resolveTargetImage(env, input.albumId, input);
-				let decision = decideOperation(input.text, target);
+				// A region only counts if it is a live segment of the target photo.
+				const [segment] =
+					input.segmentId && target
+						? await db
+								.select()
+								.from(segments)
+								.where(
+									and(
+										eq(segments.id, input.segmentId),
+										eq(segments.imageId, target.id),
+										isNull(segments.deletedAt),
+									),
+								)
+								.limit(1)
+						: [];
+				const mentionIds = await ownedAlbumImageIds(env, input.albumId, input.mentionImageIds);
+				const paletteIds = await ownedPaletteIds(env, input.user.id, input.paletteIds);
 
-				// A selected segment + an instruction = a region edit (plan 19):
-				// chat becomes a second way to drive the plan-16 endpoint.
-				if (input.segmentId && decision.operation !== "generate") {
+				let decision = decideOperation(input.text, target);
+				if (segment && decision.operation !== "generate") {
 					decision = {
 						operation: "edit",
 						targetImage: target,
-						narration: `Applying that to the selected region.`,
-						job: {
-							type: "inpaint",
-							prompt: input.text,
-							strength: 0.6,
-						},
+						narration: `Applying that to the selected ${segment.label}.`,
+						job: { type: "inpaint", prompt: input.text },
 					};
 				}
 
-				// Persist the user message.
+				const history = await recentHistory(env, input.threadId);
+				// Phase 5: tag both sides of the turn so it appears in the photo
+				// family's editor history (whichever thread it was sent from).
+				const meta = {
+					imageId: decision.targetImage?.id ?? null,
+					rootImageId: input.rootImageId ?? (decision.targetImage ? familyRoot(decision.targetImage) : null),
+					opClass: opClassOf(decision, !!segment),
+				};
 				const userMsgId = crypto.randomUUID();
 				await db.insert(chatMessages).values({
+					...meta,
 					id: userMsgId,
 					threadId: input.threadId,
 					role: "user",
 					text: input.text,
-					attachedImageId: input.attachedImageId,
-					segmentId: input.segmentId,
-					mentionImageIds: input.mentionImageIds?.join(","),
-					attachedPaletteIds: input.paletteIds?.join(","),
+					attachedImageId: target && input.attachedImageId === target.id ? target.id : null,
+					segmentId: segment?.id,
+					bboxJson: segment
+						? JSON.stringify([{ x: segment.bboxX, y: segment.bboxY, w: segment.bboxW, h: segment.bboxH }])
+						: null,
+					mentionImageIds: mentionIds.join(",") || null,
+					attachedPaletteIds: paletteIds.join(",") || null,
 				});
+				await titleThread(env, input.threadId, input.text);
 
 				const assistantId = crypto.randomUUID();
-				let jobId: string | null = null;
+				const reply = { ...meta, id: assistantId, threadId: input.threadId, role: "assistant" as const, replyToId: userMsgId };
 
-				if (decision.job) {
-					const costs: Record<string, number> = { generate: 1, inpaint: 2, enhance: 3, caption: 0 };
-					jobId = await createJob(db, {
-						type: decision.job.type,
-						userId: input.user.id,
-						imageId: decision.targetImage?.id,
-						segmentId: decision.operation === "edit" ? input.segmentId : undefined,
-						payload: { prompt: decision.job.prompt },
-					});
-					const charge = await chargeCredits(
-						db,
-						input.user.id,
-						costs[decision.job.type] ?? 0,
-						decision.job.type,
-						jobId,
-					);
-					if (!charge.ok) {
-						send("error", { code: "insufficient_credits", balance: charge.balance });
-						send("done", {});
-						controller.close();
-						return;
-					}
-					// Create the assistant row now so the queue can attach results.
-					await db.insert(chatMessages).values({
-						id: assistantId,
-						threadId: input.threadId,
-						role: "assistant",
-						text: "",
-						operation: decision.operation,
-						jobId,
-					});
-
-					if (decision.job.type === "generate") {
-						await enqueueJob(env.AI_JOBS, jobId, "generate", {
-							jobId,
-							type: "generate",
-							userId: input.user.id,
-							prompt: decision.job.prompt,
-							aspect: decision.job.aspect,
-							chatMessageId: assistantId,
-						});
-					} else if (decision.job.type === "inpaint" && decision.targetImage && input.segmentId) {
-						await enqueueJob(env.AI_JOBS, jobId, "inpaint", {
-							jobId,
-							type: "inpaint",
-							userId: input.user.id,
-							imageId: decision.targetImage.id,
-							segmentId: input.segmentId,
-							prompt: decision.job.prompt,
-							mode: "balanced",
-							chatMessageId: assistantId,
-						});
-					} else if (decision.job.type === "enhance" && decision.targetImage) {
-						await enqueueJob(env.AI_JOBS, jobId, "enhance", {
-							jobId,
-							type: "enhance",
-							userId: input.user.id,
-							imageId: decision.targetImage.id,
-							strength: decision.job.strength,
-							chatMessageId: assistantId,
-						});
-					} else if (decision.job.type === "caption" && decision.targetImage) {
-						// Inline: describe uses the provider directly (fast, cheap).
-						const provider = getProvider(env);
-						const { loadImageBytes } = await import("./lib/operations");
-						const { bytes, mime } = await loadImageBytes(env, decision.targetImage);
-						const { captionRegion } = describeViaProvider(provider);
-						const { caption } = await captionRegion(bytes, mime, "scene", "in the frame");
-						decision.narration = caption;
-					}
-				}
-
-				// Stream the narration (assistant text) through the provider so a
-				// real LLM can phrase it; mock streams word-by-word.
-				const narration = decision.narration;
-				if (decision.operation === "answer") {
-					const provider = getProvider(env);
-					const stream = await provider.streamChat([
-						{
-							role: "system",
-							content:
-								"You are Editorium's assistant inside an AI photo editor. Be brief and concrete. " +
-								"You can generate images, enhance them, and edit recognized regions.",
-						},
-						{ role: "user", content: input.text },
-					]);
-					const reader = stream.getReader();
-					let collected = "";
-					for (;;) {
-						const { done, value } = await reader.read();
-						if (done) break;
-						collected += value;
-						const clean = value.replace(/\[job:[^\]]*\]/g, "");
-						if (clean) send("token", clean);
-					}
-					await db.insert(chatMessages).values({
-						id: assistantId,
-						threadId: input.threadId,
-						role: "assistant",
-						text: collected.replace(/\[job:[^\]]*\]/g, "").trim(),
-						operation: "answer",
-					});
+				if (decision.operation === "describe" && decision.targetImage) {
+					const { bytes, mime } = await loadModelInput(env, decision.targetImage);
+					const { caption } = await getProvider(env).captionRegion(bytes, mime, "scene", "in the frame");
+					send("token", { value: caption });
+					await db.insert(chatMessages).values({ ...reply, text: caption, operation: "describe" });
 					send("done", { assistantId });
-					controller.close();
 					return;
 				}
 
-				// Operation flows: narrate, then emit tool + job events.
-				const stream = await getProvider(env).streamChat([
-					{ role: "system", content: "You are Editorium's assistant. Repeat the user's plan in one short friendly sentence. No preamble." },
-					{ role: "user", content: narration },
-				]);
-				const reader = stream.getReader();
-				let collected = "";
-				for (;;) {
-					const { done, value } = await reader.read();
-					if (done) break;
-					collected += value;
-					send("token", value);
+				if (!decision.job || decision.job.type === "caption") {
+					const collected = await streamTokens(
+						env,
+						[{ role: "system", content: SYSTEM_PROMPT }, ...history, { role: "user", content: input.text }],
+						send,
+					);
+					await db.insert(chatMessages).values({ ...reply, text: collected.trim(), operation: "answer" });
+					send("done", { assistantId });
+					return;
 				}
-				if (jobId) {
-					send("tool", { jobId, type: decision.job?.type, imageId: decision.targetImage?.id });
-					// If the job already finished (mock mode is fast), include the result.
-					const [msg] = await db
-						.select()
-						.from(chatMessages)
-						.where(eq(chatMessages.id, assistantId))
-						.limit(1);
-					send("result", {
-						assistantId,
-						jobId,
-						imageId: msg?.resultImageId ?? null,
-					});
-				}
-				await db
-					.update(chatMessages)
-					.set({ text: collected })
-					.where(eq(chatMessages.id, assistantId));
-				// Title the thread from the first exchange.
-				const [thread] = await db
-					.select()
-					.from(chatThreads)
-					.where(eq(chatThreads.id, input.threadId))
-					.limit(1);
-				if (thread && thread.title === "New chat") {
-					await db
-						.update(chatThreads)
-						.set({ title: input.text.slice(0, 48) })
-						.where(eq(chatThreads.id, input.threadId));
-				}
-				send("done", { assistantId, jobId });
-				controller.close();
-			} catch (error) {
-				send("error", {
-					message: error instanceof Error ? error.message : "Agent failure",
+
+				// Metered operation: job row → atomic charge → assistant row → enqueue.
+				const job = decision.job;
+				const jobType = job.type as Exclude<JobKind, "caption">;
+				const jobId = await createJob(db, {
+					type: jobType,
+					userId: input.user.id,
+					imageId: decision.targetImage?.id,
+					segmentId: segment?.id,
+					payload: { prompt: job.prompt },
 				});
+				const charge = await chargeCredits(db, input.user.id, CREDIT_COSTS[jobType], jobType, jobId);
+				if (!charge.ok) {
+					await db.delete(jobs).where(eq(jobs.id, jobId));
+					await db.insert(chatMessages).values({ ...reply, text: "You're out of credits.", operation: "answer" });
+					send("error", { code: "insufficient_credits", balance: charge.balance });
+					send("done", {});
+					return;
+				}
+				await db.batch([
+					db.update(chatMessages).set({ jobId }).where(eq(chatMessages.id, userMsgId)),
+					db.insert(chatMessages).values({ ...reply, text: decision.narration, operation: decision.operation, jobId }),
+				]);
+				const message: AiJobMessage = {
+					jobId,
+					type: jobType,
+					userId: input.user.id,
+					albumId: input.albumId,
+					imageId: decision.targetImage?.id,
+					segmentId: segment?.id,
+					prompt: job.prompt,
+					aspect: job.aspect,
+					origin: input.origin,
+					chatMessageId: assistantId,
+				};
+				await enqueueJob(env.AI_JOBS, jobId, jobType, { ...message });
+
+				send("token", { value: decision.narration });
+				send("tool", { jobId, type: jobType, imageId: decision.targetImage?.id ?? null });
+				send("done", { assistantId, jobId });
+			} catch (error) {
+				console.error(
+					JSON.stringify({
+						message: "agent_failure",
+						error: error instanceof Error ? error.message : String(error),
+						threadId: input.threadId,
+					}),
+				);
+				send("error", { message: "Something went wrong. Please try again." });
+			} finally {
 				controller.close();
 			}
 		},
 	});
 }
 
-function describeViaProvider(provider: ReturnType<typeof getProvider>) {
-	return {
-		captionRegion: provider.captionRegion.bind(provider),
-	};
+function opClassOf(decision: AgentDecision, hasRegion: boolean): OpClass {
+	switch (decision.job?.type) {
+		case "generate":
+			return "generate";
+		case "enhance":
+			return "enhance";
+		case "remove_bg":
+			return "segment";
+		case "inpaint":
+			return hasRegion ? "local" : "reimagine";
+		default:
+			return "answer";
+	}
+}
+
+async function streamTokens(
+	env: Env,
+	messages: Array<{ role: string; content: string }>,
+	send: (event: string, data: Record<string, unknown>) => void,
+): Promise<string> {
+	const reader = (await getProvider(env).streamChat(messages)).getReader();
+	let collected = "";
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		collected += value;
+		send("token", { value });
+	}
+	return collected;
+}
+
+/** Last few turns so follow-up questions have context. */
+async function recentHistory(env: Env, threadId: string): Promise<Array<{ role: string; content: string }>> {
+	const db = createDb(env.DB);
+	const rows = await db
+		.select({ role: chatMessages.role, text: chatMessages.text })
+		.from(chatMessages)
+		.where(eq(chatMessages.threadId, threadId))
+		.orderBy(desc(chatMessages.createdAt))
+		.limit(10);
+	return rows
+		.reverse()
+		.filter((r) => r.text.trim())
+		.map((r) => ({ role: r.role, content: r.text }));
+}
+
+async function titleThread(env: Env, threadId: string, text: string): Promise<void> {
+	const db = createDb(env.DB);
+	await db
+		.update(chatThreads)
+		.set({ title: text.slice(0, 48) })
+		.where(and(eq(chatThreads.id, threadId), eq(chatThreads.title, "New chat")));
+}
+
+async function ownedAlbumImageIds(env: Env, albumId: string, ids: string[] | undefined): Promise<string[]> {
+	if (!ids?.length) return [];
+	const db = createDb(env.DB);
+	const rows = await db
+		.select({ id: images.id })
+		.from(images)
+		.where(and(eq(images.albumId, albumId), inArray(images.id, ids.slice(0, 10))));
+	return rows.map((r) => r.id);
+}
+
+async function ownedPaletteIds(env: Env, userId: string, ids: string[] | undefined): Promise<string[]> {
+	if (!ids?.length) return [];
+	const db = createDb(env.DB);
+	const rows = await db
+		.select({ id: palettes.id })
+		.from(palettes)
+		.where(and(eq(palettes.ownerId, userId), inArray(palettes.id, ids.slice(0, 10))));
+	return rows.map((r) => r.id);
 }

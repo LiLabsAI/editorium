@@ -1,205 +1,171 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
+import { NonRetryableError } from "cloudflare:workflows";
 
-import { chatMessages, images, jobs } from "../../database/schema";
+import { albums, chatMessages, editInstructions, images, jobs, type ImageRow, type Job } from "../../database/schema";
 import { createDb } from "./lib/db";
-import { finishJob, refundCredits } from "./lib/jobs";
-import { loadImageBytes } from "./lib/operations";
+import { finishJob, refundJob, type JobType } from "./lib/jobs";
+import { logWarn } from "./lib/operations";
 import { ProviderError } from "./lib/providers";
-import {
-	markSegmentStatus,
-	persistSegments,
-	runCaptioning,
-	runDetection,
-	type SegmentationContext,
-} from "./lib/segmentation";
+import { markSegmentStatus } from "./lib/segmentation";
 import {
 	runBatchEditJob,
 	runEnhanceJob,
 	runGenerateJob,
 	runInpaintJob,
+	runRemoveBackgroundJob,
+	runSegmentation,
 	runWholePhotoEdit,
+	type JobResult,
 } from "./workflows";
 
 const MAX_ATTEMPTS = 3;
-const COSTS: Record<string, number> = { generate: 1, inpaint: 2, enhance: 3 };
-
-/** Inline segmentation executor. (The SegmentWorkflow binding stays available
- * for durable environments, but the queue path works everywhere incl. local
- * dev, so it is the default.) */
-async function runSegmentJob(
-	env: Env,
-	jobId: string,
-	userId: string,
-	image: typeof images.$inferSelect,
-): Promise<void> {
-	const db = createDb(env.DB);
-	const { bytes, mime } = await loadImageBytes(env, image);
-	const ctx: SegmentationContext = {
-		env,
-		imageId: image.id,
-		userId,
-		albumId: image.albumId,
-		imageBytes: bytes,
-		mime,
-		widthPx: image.widthPx,
-		heightPx: image.heightPx,
-	};
-	await markSegmentStatus(env, image.id, "pending");
-	const progress = async (p: number): Promise<void> => {
-		await db.update(jobs).set({ progress: p, status: "running" }).where(eq(jobs.id, jobId));
-	};
-	const tree = await runDetection(ctx, progress);
-	const captioned = await runCaptioning(ctx, tree, progress);
-	const count = await persistSegments(ctx, captioned.nodes);
-	await markSegmentStatus(env, image.id, captioned.partial ? "partial" : "ready");
-	console.log(
-		JSON.stringify({ event: "segmentation_completed", jobId, imageId: image.id, segments: count }),
-	);
-}
 
 export interface AiJobMessage {
 	jobId: string;
-	type:
-		| "segment"
-		| "generate"
-		| "enhance"
-		| "inpaint"
-		| "caption"
-		| "thumb"
-		| "batch_edit";
+	type: JobType;
 	userId: string;
 	imageId?: string;
+	/** Target album for jobs without a source image (chat generation). */
+	albumId?: string;
 	segmentId?: string;
 	prompt?: string;
 	aspect?: string;
-	strength?: number;
-	mode?: "literal" | "balanced" | "creative";
-	instructions?: Array<{
-		text: string;
-		bbox: { x: number; y: number; w: number; h: number };
-	}>;
+	instructions?: Array<{ text: string; bbox: { x: number; y: number; w: number; h: number } }>;
+	/** Pinned instructions this batch applies (only these get marked applied). */
+	instructionIds?: string[];
 	label?: string;
+	/** Worker origin, for building signed URLs external models can fetch. */
 	origin?: string;
+	/** Chat message to link the result onto (agent-initiated jobs). */
+	chatMessageId?: string;
 }
 
-/** Queue consumer: dispatches AI operations and settles their job rows. */
-export async function handleQueue(
-	batch: MessageBatch<AiJobMessage>,
-	env: Env,
-): Promise<void> {
+type Db = ReturnType<typeof createDb>;
+
+async function loadImage(db: Db, imageId: string | undefined): Promise<ImageRow> {
+	const [image] = imageId ? await db.select().from(images).where(eq(images.id, imageId)).limit(1) : [];
+	if (!image) throw new ProviderError(`image ${imageId ?? "(none)"} not found`);
+	return image;
+}
+
+/** Run one job. Returns the branched photo, or null for segmentation. */
+async function dispatch(env: Env, db: Db, msg: AiJobMessage): Promise<JobResult | null> {
+	switch (msg.type) {
+		case "segment": {
+			const image = await loadImage(db, msg.imageId);
+			await runSegmentation(env, msg.jobId, msg.userId, image);
+			return null;
+		}
+		case "generate": {
+			if (!msg.prompt) throw new ProviderError("generate job has no prompt");
+			const source = msg.imageId ? await loadImage(db, msg.imageId) : null;
+			const albumId = msg.albumId ?? source?.albumId;
+			const [album] = albumId ? await db.select().from(albums).where(eq(albums.id, albumId)).limit(1) : [];
+			if (!album) throw new ProviderError("target album not found");
+			return runGenerateJob(env, msg.userId, album.id, msg.prompt, msg.aspect, source);
+		}
+		case "enhance":
+			return runEnhanceJob(env, msg.userId, await loadImage(db, msg.imageId));
+		case "remove_bg":
+			return runRemoveBackgroundJob(env, msg.userId, await loadImage(db, msg.imageId));
+		case "inpaint": {
+			if (!msg.prompt) throw new ProviderError("edit job has no prompt");
+			const image = await loadImage(db, msg.imageId);
+			return msg.segmentId
+				? runInpaintJob(env, msg.userId, image, msg.segmentId, msg.prompt)
+				: runWholePhotoEdit(env, msg.userId, image, msg.prompt, msg.origin);
+		}
+		case "batch_edit": {
+			if (!msg.instructions?.length) throw new ProviderError("batch edit has no instructions");
+			const image = await loadImage(db, msg.imageId);
+			return runBatchEditJob(env, msg.userId, image, msg.instructions, msg.label ?? "Edited photo");
+		}
+		default:
+			throw new ProviderError(`unsupported job type ${msg.type}`);
+	}
+}
+
+/** Link a finished result onto the job, the originating chat message and the
+ * applied instruction chips. */
+async function linkResult(db: Db, msg: AiJobMessage, result: JobResult): Promise<void> {
+	await db.update(jobs).set({ resultImageId: result.imageId }).where(eq(jobs.id, msg.jobId));
+	if (msg.chatMessageId) {
+		await db
+			.update(chatMessages)
+			.set({ resultImageId: result.imageId, resultVersionId: result.versionId })
+			.where(eq(chatMessages.id, msg.chatMessageId));
+	}
+	if (msg.type === "batch_edit" && msg.imageId && msg.instructionIds?.length) {
+		await db
+			.update(editInstructions)
+			.set({ status: "applied", resultImageId: result.imageId })
+			.where(
+				and(
+					eq(editInstructions.imageId, msg.imageId),
+					inArray(editInstructions.id, msg.instructionIds),
+					eq(editInstructions.status, "pending"),
+				),
+			);
+	}
+}
+
+function isRetryable(error: unknown): boolean {
+	if (error instanceof ProviderError) return error.retryable;
+	if (error instanceof NonRetryableError) return false;
+	return true; // unknown errors (D1/R2 hiccups) get another attempt
+}
+
+/**
+ * Queue consumer. Delivery is at-least-once, so every message is checked
+ * against its job row first: finished jobs are acked without re-running
+ * (no duplicate photos, no double refunds).
+ */
+export async function handleQueue(batch: MessageBatch<AiJobMessage>, env: Env): Promise<void> {
 	const db = createDb(env.DB);
 	for (const message of batch.messages) {
 		const msg = message.body;
+		const [job]: Job[] = msg?.jobId
+			? await db.select().from(jobs).where(eq(jobs.id, msg.jobId)).limit(1)
+			: [];
+		if (!job || job.userId !== msg.userId) {
+			logWarn("queue_message_without_job", "dropped", { jobId: msg?.jobId });
+			message.ack();
+			continue;
+		}
+		if (job.status === "done" || job.status === "error") {
+			message.ack();
+			continue;
+		}
+		if (job.resultImageId) {
+			// Result was stored but the job was never closed (crash in between).
+			await finishJob(db, job.id, "done");
+			message.ack();
+			continue;
+		}
 		try {
-			if (msg.type === "segment") {
-				const [segmentImage] = msg.imageId
-					? await db.select().from(images).where(eq(images.id, msg.imageId)).limit(1)
-					: [];
-				if (!segmentImage) throw new Error(`image ${msg.imageId} not found`);
-				await db.update(jobs).set({ status: "running" }).where(eq(jobs.id, msg.jobId));
-				await runSegmentJob(env, msg.jobId, msg.userId, segmentImage);
-				await finishJob(db, msg.jobId, "done");
-				message.ack();
-				continue;
-			}
-			const [image] = msg.imageId
-				? await db.select().from(images).where(eq(images.id, msg.imageId)).limit(1)
-				: [];
-			if (!image) throw new Error(`image ${msg.imageId} not found`);
-
-			let result: { imageId: string; versionId: string } | null = null;
-			if (msg.type === "generate" && msg.prompt) {
-				result = await runGenerateJob(env, msg.userId, image, msg.prompt, msg.aspect);
-			} else if (msg.type === "enhance") {
-				result = await runEnhanceJob(env, msg.userId, image, msg.strength ?? 0.8);
-			} else if (msg.type === "inpaint" && msg.segmentId && msg.prompt) {
-				result = await runInpaintJob(
-					env,
-					msg.userId,
-					image,
-					msg.segmentId,
-					msg.prompt,
-					msg.mode ?? "balanced",
-				);
-			} else if (msg.type === "inpaint" && msg.prompt) {
-				// Whole-photo instruction edit (no region): Pruna edit, full frame.
-				result = await runWholePhotoEdit(
-					env,
-					msg.userId,
-					image,
-					msg.prompt,
-					(msg as { origin?: string }).origin,
-				);
-			} else if (msg.type === "batch_edit" && msg.instructions?.length) {
-				result = await runBatchEditJob(
-					env,
-					msg.userId,
-					image,
-					msg.instructions,
-					msg.label ?? "Edited photo",
-				);
-				// Mark the pinned chips applied + link the branch.
-				const { editInstructions } = await import("../../database/schema");
-				await db
-					.update(editInstructions)
-					.set({ status: "applied", resultImageId: result!.imageId })
-					.where(
-						and(eq(editInstructions.imageId, image.id), eq(editInstructions.status, "pending")),
-					);
-			} else if (msg.type === "thumb" && msg.imageId) {
-				// thumbnails are derived inline at registration; nothing to do
-			}
-
-			// Link the branched photo onto the job (clients navigate via this)
-			// and onto a chat message when the op came from the agent.
+			await db.update(jobs).set({ status: "running" }).where(eq(jobs.id, job.id));
+			const result = await dispatch(env, db, msg);
 			if (result) {
-				await db
-					.update(jobs)
-					.set({ resultImageId: result.imageId })
-					.where(eq(jobs.id, msg.jobId));
-				const chatMessageId = (msg as { chatMessageId?: string }).chatMessageId;
-				if (chatMessageId) {
-					await db
-						.update(chatMessages)
-						.set({
-							resultImageId: result.imageId,
-							resultVersionId: result.versionId,
-						})
-						.where(eq(chatMessages.id, chatMessageId));
-				}
-				// (auto-detection removed — regions are user-drawn now)
+				await linkResult(db, msg, result);
 				console.log(
-					JSON.stringify({
-						event: "ai_job_completed",
-						type: msg.type,
-						jobId: msg.jobId,
-						imageId: result.imageId,
-					}),
+					JSON.stringify({ event: "ai_job_completed", type: msg.type, jobId: job.id, imageId: result.imageId }),
 				);
 			}
-			await finishJob(db, msg.jobId, "done");
+			await finishJob(db, job.id, "done");
 			message.ack();
 		} catch (error) {
-			const retryable = !(error instanceof ProviderError) || error.retryable;
-			const willRetry = retryable && message.attempts < MAX_ATTEMPTS;
-			if (!willRetry) {
-				await finishJob(
-					db,
-					msg.jobId,
-					"error",
-					error instanceof Error ? error.message : "Unknown error",
-				);
-				// Refund metered operations that failed permanently.
-				const refund = COSTS[msg.type] ?? 0;
-				if (refund > 0) {
-					await refundCredits(db, msg.userId, refund, `refund:${msg.type}`, msg.jobId);
-				}
-				message.ack();
-			} else {
+			const willRetry = isRetryable(error) && message.attempts < MAX_ATTEMPTS;
+			logWarn("ai_job_failed", error, { jobId: job.id, type: msg.type, attempt: message.attempts, willRetry });
+			if (willRetry) {
 				// Keep the row visible as queued while the retry backs off.
-				await db.update(jobs).set({ status: "queued", progress: 0 }).where(eq(jobs.id, msg.jobId));
+				await db.update(jobs).set({ status: "queued", progress: 0 }).where(eq(jobs.id, job.id));
 				message.retry({ delaySeconds: Math.min(60, 5 * 2 ** message.attempts) });
+				continue;
 			}
+			await finishJob(db, job.id, "error", error instanceof Error ? error.message : "Unknown error");
+			await refundJob(db, job.id);
+			if (msg.type === "segment" && msg.imageId) await markSegmentStatus(env, msg.imageId, "failed");
+			message.ack();
 		}
 	}
 }

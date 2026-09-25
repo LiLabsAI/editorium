@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 
 import { segments } from "../../../database/schema";
 import { createDb } from "./db";
@@ -100,33 +100,14 @@ function qualityFilter(boxes: DetectedBox[], _ctx: SegmentationContext): Detecte
 		.filter((b) => b.w * b.h >= MIN_AREA || SMALL_OK.has(b.label));
 }
 
-/** Downscale raster input before model calls (≤1024px) to respect model
- * limits; SVG passes through untouched. */
-async function prepareModelInput(ctx: SegmentationContext): Promise<{ bytes: ArrayBuffer; mime: string }> {
-	if (ctx.mime === "image/svg+xml" || ctx.widthPx === 0) {
-		return { bytes: ctx.imageBytes, mime: ctx.mime };
-	}
-	try {
-		const { transformWithImagesBytes } = await import("./operations");
-		const longest = Math.max(ctx.widthPx, ctx.heightPx);
-		if (longest > 1024) {
-			const scaled = await transformWithImagesBytes(ctx.env, ctx.imageBytes, 1024);
-			if (scaled) return { bytes: scaled, mime: "image/jpeg" };
-		}
-	} catch {
-		// fall through to the original bytes
-	}
-	return { bytes: ctx.imageBytes, mime: ctx.mime };
-}
-
 /** Detect + hierarchy. Boxes nested inside a person become that person's children. */
 export async function runDetection(
 	ctx: SegmentationContext,
 	onProgress?: (p: number) => Promise<void> | void,
 ): Promise<DetectedTree> {
 	const provider = getProvider(ctx.env);
-	const input = await prepareModelInput(ctx);
-	const rawBoxes = await provider.detect(input.bytes, input.mime);
+	// ctx.imageBytes is already the downscaled model input (loadModelInput).
+	const rawBoxes = await provider.detect(ctx.imageBytes, ctx.mime);
 	const boxes = dedupeBoxes(qualityFilter(rawBoxes, ctx));
 	if (onProgress) await onProgress(25);
 
@@ -207,33 +188,30 @@ function positionWord(centerX: number, isChild: boolean): string {
 	return "at the center of the frame";
 }
 
+/** Crop a normalized box out of the model input via the Images binding
+ * (`trim` = a real crop; the old code resized the whole frame, so every
+ * "crop" was the image centre). Falls back to the full image. */
 async function cropRegion(
 	ctx: SegmentationContext,
 	box: DetectedBox,
 ): Promise<{ data: ArrayBuffer; mime: string }> {
-	if (ctx.mime === "image/svg+xml" || ctx.widthPx === 0) {
+	if (ctx.widthPx === 0 || ctx.heightPx === 0) {
 		return { data: ctx.imageBytes, mime: ctx.mime };
 	}
-	// Prefer a true crop via the Images binding; fall back to the full image.
 	try {
-		const images = ctx.env.IMAGES;
-		if (images && typeof images.input === "function") {
-			const stream = new Response(ctx.imageBytes).body;
-			if (stream) {
-				const out = await images
-					.input(stream)
-					.transform({
-						width: Math.max(64, Math.round(box.w * ctx.widthPx)),
-						height: Math.max(64, Math.round(box.h * ctx.heightPx)),
-						fit: "cover",
-					})
-					.output({ format: "image/png" });
-				const buf = await (out.response() as Response).arrayBuffer();
-				return { data: buf, mime: "image/png" };
-			}
+		const stream = new Response(ctx.imageBytes).body;
+		if (stream && typeof ctx.env.IMAGES?.input === "function") {
+			const left = Math.max(0, Math.floor(box.x * ctx.widthPx));
+			const top = Math.max(0, Math.floor(box.y * ctx.heightPx));
+			const width = Math.max(1, Math.min(ctx.widthPx - left, Math.round(box.w * ctx.widthPx)));
+			const height = Math.max(1, Math.min(ctx.heightPx - top, Math.round(box.h * ctx.heightPx)));
+			const out = await ctx.env.IMAGES.input(stream)
+				.transform({ trim: { left, top, width, height } })
+				.output({ format: "image/png" });
+			return { data: await out.response().arrayBuffer(), mime: "image/png" };
 		}
-	} catch {
-		// fall through to full-image fallback
+	} catch (error) {
+		console.warn(JSON.stringify({ message: "segment_crop_failed", error: String(error) }));
 	}
 	return { data: ctx.imageBytes, mime: ctx.mime };
 }
@@ -299,13 +277,17 @@ export async function runCaptioning(
 }
 
 /** Persist the captioned tree; top-level rows are inserted first so children
- * reference real parent ids. Returns the count of stored segments. */
+ * reference real parent ids. Only previous AUTO-detected rows are replaced —
+ * hand-drawn regions (polygonJson set) and their prompts survive a re-run.
+ * Returns the count of stored segments. */
 export async function persistSegments(
 	ctx: SegmentationContext,
 	nodes: CaptionedNode[],
 ): Promise<number> {
 	const db = createDb(ctx.env.DB);
-	await db.delete(segments).where(eq(segments.imageId, ctx.imageId));
+	await db
+		.delete(segments)
+		.where(and(eq(segments.imageId, ctx.imageId), isNull(segments.polygonJson)));
 
 	let stored = 0;
 	let nodeIdCounter = 0;

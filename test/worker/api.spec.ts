@@ -1,30 +1,7 @@
-import { env, exports } from "cloudflare:workers";
+import { exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 
-const PNG_1PX = new Uint8Array([
-	0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // PNG signature
-	0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, // IHDR length + type
-	0, 0, 0, 4, 0, 0, 0, 3, // 4x3
-	0x08, 0x06, 0, 0, 0, 0xaa, 0x61, 0x67, 0xf4, 0x64, 0x81, 0x00, 0x00, 0x00, 0x00,
-]).buffer;
-
-async function register(): Promise<string> {
-	const res = await exports.default.fetch("http://example.com/api/auth/demo", {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ name: "Test User" }),
-	});
-	expect(res.status).toBe(200);
-	const cookie = res.headers.get("Set-Cookie")!.split(";")[0]!;
-	return cookie;
-}
-
-function authed(cookie: string, path: string, init?: RequestInit): Request {
-	return new Request(`http://example.com/api${path}`, {
-		...init,
-		headers: { ...(init?.headers ?? {}), Cookie: cookie },
-	});
-}
+import { call, createAlbum, guest, json, uploadPng } from "./helpers";
 
 describe("Worker API", () => {
 	it("returns the API identity and health payloads", async () => {
@@ -37,51 +14,23 @@ describe("Worker API", () => {
 	});
 
 	it("creates a session, project, album and registers an image", async () => {
-		const cookie = await register();
-
-		const albumsRes = await exports.default.fetch(
-			authed(cookie, "/albums"),
-		);
-		const { project } = (await albumsRes.json()) as {
-			project: { id: string };
-		};
+		const cookie = await guest();
+		const { project } = await json<{ project: { id: string } }>(await call("/albums", {}, cookie));
 		expect(project.id).toBeTruthy();
 
-		const created = await exports.default.fetch(
-			authed(cookie, "/albums", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ title: "Test Album" }),
-			}),
-		);
-		expect(created.status).toBe(201);
-		const { album } = (await created.json()) as { album: { id: string; title: string } };
-		expect(album.title).toBe("Test Album");
+		const albumId = await createAlbum(cookie, "Test Album");
+		const image = await uploadPng(cookie, albumId, 4, 3);
+		expect(image.widthPx).toBe(4);
 
-		const form = new FormData();
-		form.append("file", new File([PNG_1PX], "test.png", { type: "image/png" }));
-		const upload = await exports.default.fetch(
-			authed(cookie, `/albums/${album.id}/upload`, { method: "POST", body: form }),
+		const { images } = await json<{ images: Array<{ id: string; segmentStatus: string }> }>(
+			await call(`/albums/${albumId}/images`, {}, cookie),
 		);
-		const uploadBody = (await upload.json()) as {
-			image?: { id: string; segmentStatus: string };
-			error?: string;
-		};
-		if (upload.status !== 201) {
-			// Queue binding may be unavailable in the test runtime; the rest of
-			// the pipeline is covered below via segments/palette routes.
-			expect(uploadBody.error).toBeTruthy();
-		} else {
-			// auto-detection was removed: uploads start with no segments
-			expect(uploadBody.image!.segmentStatus).toBe("none");
-			expect(env.DB).toBeTruthy();
-		}
+		expect(images).toHaveLength(1);
+		expect(images[0]!.segmentStatus).toBe("none");
 	});
 
 	it("rejects anonymous access to protected routes", async () => {
-		const res = await exports.default.fetch(
-			new Request("http://example.com/api/albums"),
-		);
+		const res = await exports.default.fetch(new Request("http://example.com/api/albums"));
 		expect(res.status).toBe(401);
 	});
 });

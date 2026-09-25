@@ -1,0 +1,8 @@
+{
+	"$schema": "../node_modules/wrangler/config-schema.json",
+	"name": "editorium-probe",
+	"main": "./probe-noop.js",
+	"compatibility_date": "2026-07-14",
+	"images": { "binding": "IMAGES", "remote": true },
+	"ai": { "binding": "AI", "remote": true }
+}

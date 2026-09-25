@@ -1,48 +1,39 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router";
 
-import { api, fileUrl } from "../lib/api";
+import { api, shareFileUrl } from "../lib/api";
 import { LogoMark } from "../components/TopBar";
 
-/** Public share viewer (no auth): image + "Made with Editorium" + download. */
+/** Public share viewer (no session): image + "Made with Editorium" + download.
+ * Everything is addressed by the share token, so revoking the link or turning
+ * off downloads takes effect on the server, not just in this UI. */
 export function SharePage() {
 	const { token } = useParams<{ token: string }>();
 	const [state, setState] = useState<
-		{ status: "loading" } | { status: "gone" } | { status: "ready"; imageId: string; allowDownload: boolean }
+		{ status: "loading" } | { status: "gone" } | { status: "ready"; allowDownload: boolean; title: string }
 	>({ status: "loading" });
 
 	useEffect(() => {
 		if (!token) return;
-		api.publicShare(token).then((res) => {
-			if (res.share.imageId) {
-				setState({ status: "ready", imageId: res.share.imageId, allowDownload: res.share.allowDownload });
-			} else {
-				setState({ status: "gone" });
-			}
-		}).catch(() => setState({ status: "gone" }));
+		api
+			.publicShare(token)
+			.then((res) => setState({ status: "ready", allowDownload: res.share.allowDownload, title: res.share.title }))
+			.catch(() => setState({ status: "gone" }));
 	}, [token]);
 
 	if (state.status === "loading") {
 		return <div className="flex h-screen items-center justify-center text-muted-foreground">Loading…</div>;
 	}
-	if (state.status === "gone") {
+	if (state.status === "gone" || !token) {
 		return (
 			<div className="flex h-screen flex-col items-center justify-center gap-3">
 				<LogoMark />
 				<p className="text-muted-foreground">This link has expired or was revoked.</p>
-				<Link to="/" className="text-sm underline">Open Editorium</Link>
+				<Link to="/" className="text-sm underline">
+					Open Editorium
+				</Link>
 			</div>
 		);
-	}
-
-	async function download() {
-		const res = await fetch(`/api/public/images/${state.status === "ready" ? state.imageId : ""}`);
-		const blob = await res.blob();
-		const a = document.createElement("a");
-		a.href = URL.createObjectURL(blob);
-		a.download = "editorium-image";
-		a.click();
-		URL.revokeObjectURL(a.href);
 	}
 
 	return (
@@ -53,15 +44,19 @@ export function SharePage() {
 					<span className="font-medium">Editorium</span>
 				</Link>
 				{state.allowDownload && (
-					<button onClick={download} className="rounded-full bg-foreground px-4 py-1.5 text-sm font-medium text-background">
+					// Server sends Content-Disposition: attachment for the original.
+					<a
+						href={shareFileUrl(token, "original")}
+						className="rounded-full bg-foreground px-4 py-1.5 text-sm font-medium text-background"
+					>
 						Download
-					</button>
+					</a>
 				)}
 			</header>
 			<main className="flex flex-1 items-center justify-center p-8">
 				<img
-					src={state.status === "ready" ? fileUrl(state.imageId, "web") : ""}
-					alt="Shared image"
+					src={shareFileUrl(token, "web")}
+					alt={state.title || "Shared image"}
 					className="max-h-full max-w-full rounded-lg shadow-2xl"
 				/>
 			</main>

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 
-import { api, fileUrl, type AlbumSummary, type Me } from "../lib/api";
+import { api, describeError, fileUrl, type AlbumSummary, type Me } from "../lib/api";
 import { TopBar } from "../components/TopBar";
 
 /** Dashboard (Screen A): workspace hero, Albums/References tabs, sort/filter/
@@ -15,12 +15,26 @@ export function Dashboard({ me }: { me: Me | null }) {
 	const [albums, setAlbums] = useState<AlbumSummary[]>([]);
 	const [projectName, setProjectName] = useState("Project");
 	const [creating, setCreating] = useState(false);
+	const [error, setError] = useState<string | null>(null);
 
 	useEffect(() => {
-		api.albums(query || undefined, sort).then((res) => {
-			setAlbums(res.albums);
-			setProjectName(res.project.name);
-		});
+		// Debounce typing, and ignore responses that arrive out of order.
+		let stale = false;
+		const timer = window.setTimeout(() => {
+			api
+				.albums(query || undefined, sort)
+				.then((res) => {
+					if (stale) return;
+					setAlbums(res.albums);
+					setProjectName(res.project.name);
+					setError(null);
+				})
+				.catch((err) => !stale && setError(describeError(err)));
+		}, query ? 250 : 0);
+		return () => {
+			stale = true;
+			window.clearTimeout(timer);
+		};
 	}, [query, sort]);
 
 	async function createAlbum() {
@@ -28,6 +42,8 @@ export function Dashboard({ me }: { me: Me | null }) {
 		try {
 			const { album } = await api.createAlbum();
 			navigate(`/albums/${album.id}`);
+		} catch (err) {
+			setError(describeError(err));
 		} finally {
 			setCreating(false);
 		}
@@ -94,13 +110,6 @@ export function Dashboard({ me }: { me: Me | null }) {
 							<option value="oldest">By oldest</option>
 							<option value="name">By name</option>
 						</select>
-						<select
-							aria-label="Filter"
-							defaultValue="all"
-							className="rounded-lg bg-transparent px-2 py-1 text-sm text-muted-foreground hover:bg-muted"
-						>
-							<option value="all">All</option>
-						</select>
 						<button
 							aria-label="Search"
 							onClick={() => setSearchOpen((v) => !v)}
@@ -118,6 +127,12 @@ export function Dashboard({ me }: { me: Me | null }) {
 						onChange={(e) => setQuery(e.target.value)}
 						className="mt-3 w-full rounded-xl border ed-hairline bg-card px-3 py-2 text-sm outline-none focus:border-ring"
 					/>
+				)}
+
+				{error && (
+					<p role="alert" className="mt-3 text-sm text-red-300">
+						{error}
+					</p>
 				)}
 
 				{tab === "albums" ? (

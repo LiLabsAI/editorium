@@ -36,6 +36,27 @@
       "when": 1789923788002,
       "tag": "0004_jazzy_network",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1790283290703,
+      "tag": "0005_indexes_and_owner_unique",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1790286750908,
+      "tag": "0006_version_audit",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1790288550971,
+      "tag": "0007_editor_history",
+      "breakpoints": true
     }
   ]
 }

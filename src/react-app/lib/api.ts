@@ -37,6 +37,10 @@ export interface VersionDto {
 	label: string;
 	operation: string | null;
 	prompt: string | null;
+	/** How this version was produced (phase 4 audit). */
+	opClass: "adjust" | "enhance" | "segment" | "local" | "reimagine" | "generate" | null;
+	model: string | null;
+	fidelity: number | null;
 	createdAt: string;
 }
 
@@ -61,6 +65,8 @@ export interface ThreadDto {
 	id: string;
 	albumId: string;
 	title: string;
+	/** Set for a photo family's editor history (phase 5). */
+	rootImageId: string | null;
 	createdAt: string;
 }
 
@@ -86,35 +92,84 @@ export interface JobDto {
 	resultImageId: string | null;
 }
 
+export type OpClass = "adjust" | "enhance" | "segment" | "local" | "reimagine" | "generate" | "answer" | "upload";
+export type Box = { x: number; y: number; w: number; h: number };
+
+/** One request and its reply in a photo family's history (server-derived). */
+export interface HistoryTurn {
+	id: string;
+	createdAt: string;
+	derived: boolean;
+	request: { text: string; opClass: OpClass | null; bboxes: Box[]; imageId: string | null };
+	reply: {
+		status: "queued" | "running" | "done" | "error";
+		text: string;
+		error: string | null;
+		credits: number;
+		refunded: boolean;
+		result: {
+			imageId: string;
+			label: string;
+			opClass: string | null;
+			model: string | null;
+			fidelity: number | null;
+			exists: boolean;
+		} | null;
+	};
+}
+
 export interface PaletteDto {
 	palette: { id: string; colorsJson: string; source: string };
 	link: { scope: string; segmentId: string | null };
 }
 
+export class ApiError extends Error {
+	constructor(
+		readonly code: string,
+		readonly status: number,
+	) {
+		super(code);
+		this.name = "ApiError";
+	}
+}
+
+/** Turn an API error code into a sentence for the UI. */
+export function describeError(err: unknown): string {
+	const code = err instanceof ApiError ? err.code : err instanceof Error ? err.message : String(err);
+	const messages: Record<string, string> = {
+		rate_limited: "You're going a bit fast — wait a minute and try again.",
+		insufficient_credits: "You're out of credits.",
+		unauthorized: "Your session expired — reload the page.",
+		file_too_large: "That file is larger than 25 MB.",
+		not_an_image: "That file isn't a PNG, JPEG, WebP or GIF image.",
+		invalid_body: "That request wasn't valid.",
+		not_found: "That item no longer exists.",
+	};
+	return messages[code] ?? "Something went wrong. Please try again.";
+}
+
+async function throwIfNotOk(res: Response): Promise<void> {
+	if (res.ok) return;
+	const detail = (await res.json().catch(() => ({}))) as { error?: string };
+	throw new ApiError(detail.error ?? res.statusText ?? "error", res.status);
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	const res = await fetch(`/api${path}`, {
-		headers: init?.body ? { "Content-Type": "application/json" } : undefined,
+		headers: typeof init?.body === "string" ? { "Content-Type": "application/json" } : undefined,
 		...init,
-		body: typeof init?.body === "string" ? init.body : init?.body,
 	});
-	if (!res.ok) {
-		const detail = await res.json().catch(() => ({}));
-		const err = new Error((detail as { error?: string }).error ?? res.statusText) as Error & {
-			status?: number;
-		};
-		err.status = res.status;
-		throw err;
-	}
+	await throwIfNotOk(res);
 	return res.json() as Promise<T>;
 }
 
 export const api = {
 	me: () => request<Me>("/me"),
-	demoLogin: (name?: string) =>
-		request<{ ok: boolean }>("/auth/demo", {
-			method: "POST",
-			body: JSON.stringify({ name }),
-		}),
+	/** Private guest account for this browser (no-op if already signed in). */
+	guest: () => request<{ ok: boolean; userId: string }>("/auth/guest", { method: "POST" }),
+	claimOwner: (key: string) =>
+		request<{ ok: boolean }>("/auth/claim", { method: "POST", body: JSON.stringify({ key }) }),
+	logout: () => request<{ ok: boolean }>("/auth/logout", { method: "POST" }),
 
 	albums: (q?: string, sort?: string) =>
 		request<{ project: { id: string; name: string }; albums: AlbumSummary[] }>(
@@ -157,7 +212,8 @@ export const api = {
 			body: JSON.stringify(body),
 		}),
 
-	image: (id: string) => request<{ image: ImageDto; versions: VersionDto[] }>(`/images/${id}`),
+	image: (id: string) =>
+		request<{ image: ImageDto; album: { id: string; title: string }; versions: VersionDto[] }>(`/images/${id}`),
 	imageVersions: (id: string) =>
 		request<{ versions: VersionDto[]; currentId: string | null }>(`/images/${id}/versions`),
 	activateVersion: (imageId: string, versionId: string) =>
@@ -208,6 +264,9 @@ export const api = {
 
 	job: (id: string) => request<{ job: JobDto }>(`/jobs/${id}`),
 
+	/** Photo-family timeline + its chat thread (phase 5). */
+	history: (imageId: string) =>
+		request<{ threadId: string; rootImageId: string; turns: HistoryTurn[] }>(`/images/${imageId}/history`),
 	branchFamily: (imageId: string) =>
 		request<{ images: ImageDto[] }>(`/images/${imageId}/branch`),
 	filterBranch: async (imageId: string, label: string, blob: Blob) => {
@@ -215,7 +274,7 @@ export const api = {
 		form.append("file", blob, "filtered.png");
 		form.append("label", label);
 		const res = await fetch(`/api/images/${imageId}/filter-branch`, { method: "POST", body: form });
-		if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error ?? "filter failed");
+		await throwIfNotOk(res);
 		return (await res.json()) as { imageId: string; versionId: string };
 	},
 	editImage: (imageId: string, prompt: string) =>
@@ -244,20 +303,21 @@ export const api = {
 		}),
 	deleteInstruction: (id: string) =>
 		request<{ ok: boolean }>(`/instructions/${id}`, { method: "DELETE" }),
-	applyInstructions: (imageId: string) =>
+	/** Apply pinned instructions; pass ids to apply only those chips. */
+	applyInstructions: (imageId: string, instructionIds?: string[]) =>
 		request<{ jobId: string; label: string }>(`/images/${imageId}/apply-instructions`, {
 			method: "POST",
+			body: JSON.stringify({ instructionIds }),
 		}),
-	editRegion: (imageId: string, segmentId: string, prompt: string, mode = "balanced") =>
+	editRegion: (imageId: string, segmentId: string, prompt: string) =>
 		request<{ jobId: string }>(`/images/${imageId}/edit-region`, {
 			method: "POST",
-			body: JSON.stringify({ segmentId, prompt, mode }),
+			body: JSON.stringify({ segmentId, prompt }),
 		}),
-	enhanceImage: (imageId: string, strength = 0.8) =>
-		request<{ jobId: string }>(`/images/${imageId}/enhance`, {
-			method: "POST",
-			body: JSON.stringify({ strength }),
-		}),
+	removeBackground: (imageId: string) =>
+		request<{ jobId: string }>(`/images/${imageId}/remove-background`, { method: "POST" }),
+	enhanceImage: (imageId: string) =>
+		request<{ jobId: string }>(`/images/${imageId}/enhance`, { method: "POST" }),
 	duplicateImage: (imageId: string) =>
 		request<{ image: ImageDto }>(`/images/${imageId}/duplicate`, { method: "POST" }),
 	createSegment: (
@@ -295,7 +355,7 @@ export const api = {
 			body: JSON.stringify({ allowDownload }),
 		}),
 	publicShare: (token: string) =>
-		request<{ share: { allowDownload: boolean; imageId: string | null } }>(`/public/share/${token}`),
+		request<{ share: { allowDownload: boolean; title: string } }>(`/public/share/${token}`),
 
 	usage: () =>
 		request<{ balance: number; events: Array<{ reason: string; total: number; credits: number }> }>(
@@ -312,6 +372,58 @@ export function fileUrl(
 	return `/api/images/${imageId}/file?variant=${variant}${v}`;
 }
 
+/** Read the agent's SSE stream (`data: {event, data}` frames), calling
+ * `onFrame` per frame; malformed frames are skipped. */
+export async function readAgentStream(
+	res: Response,
+	onFrame: (event: string, data: Record<string, unknown>) => void,
+): Promise<void> {
+	if (!res.ok || !res.body) {
+		const detail = (await res.json().catch(() => ({}))) as { error?: string };
+		throw new ApiError(detail.error ?? "error", res.status);
+	}
+	const reader = res.body.getReader();
+	const decoder = new TextDecoder();
+	let buffer = "";
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		buffer += decoder.decode(value, { stream: true });
+		const parts = buffer.split("\n\n");
+		buffer = parts.pop() ?? "";
+		for (const part of parts) {
+			const line = part.trim();
+			if (!line.startsWith("data:")) continue;
+			try {
+				const frame = JSON.parse(line.slice(5).trim()) as { event: string; data: Record<string, unknown> };
+				onFrame(frame.event, frame.data ?? {});
+			} catch {
+				// skip a malformed frame
+			}
+		}
+	}
+}
+
+/** Public share media, addressed by TOKEN (an image id grants nothing). */
+export function shareFileUrl(token: string, variant: "web" | "original" = "web"): string {
+	return `/api/public/share/${encodeURIComponent(token)}/file?variant=${variant}`;
+}
+
+/** Poll a job until it settles. Resolves with the job, or `null` on timeout
+ * (the job may still finish later — callers say so instead of going quiet). */
+export async function waitForJob(
+	jobId: string,
+	{ timeoutMs = 120_000, intervalMs = 1500 }: { timeoutMs?: number; intervalMs?: number } = {},
+): Promise<JobDto | null> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const { job } = await api.job(jobId);
+		if (job.status === "done" || job.status === "error") return job;
+		await new Promise((r) => setTimeout(r, intervalMs));
+	}
+	return null;
+}
+
 export function segmentCropUrl(segmentId: string): string {
 	return `/api/segments/${segmentId}/crop`;
 }
@@ -321,9 +433,6 @@ export async function uploadFile(albumId: string, file: File): Promise<{ image: 
 	const form = new FormData();
 	form.append("file", file);
 	const res = await fetch(`/api/albums/${albumId}/upload`, { method: "POST", body: form });
-	if (!res.ok) {
-		const detail = await res.json().catch(() => ({}));
-		throw new Error((detail as { error?: string }).error ?? "Upload failed");
-	}
+	await throwIfNotOk(res);
 	return res.json();
 }
