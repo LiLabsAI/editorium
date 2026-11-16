@@ -13,12 +13,16 @@ export function toBase64Url(bytes: Uint8Array): string {
 }
 
 export function fromBase64Url(text: string): Uint8Array | null {
-	if (!/^[A-Za-z0-9_-]*$/.test(text)) return null;
+	if (!/^[A-Za-z0-9_-]*$/.test(text) || text.length % 4 === 1) return null;
 	const padded = text.replace(/-/g, "+").replace(/_/g, "/");
-	const binary = atob(padded + "=".repeat((4 - (padded.length % 4)) % 4));
-	const bytes = new Uint8Array(binary.length);
-	for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-	return bytes;
+	try {
+		const binary = atob(padded + "=".repeat((4 - (padded.length % 4)) % 4));
+		const bytes = new Uint8Array(binary.length);
+		for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+		return bytes;
+	} catch {
+		return null;
+	}
 }
 
 function requireSecret(secret: string | undefined): string {
@@ -41,10 +45,11 @@ export async function mac(purpose: MacPurpose, payload: string, secret: string |
 	return toBase64Url(new Uint8Array(sig));
 }
 
-/** Constant-time string comparison (Workers' crypto.subtle.timingSafeEqual). */
-export function safeEqual(a: string, b: string): boolean {
-	const left = encoder.encode(a);
-	const right = encoder.encode(b);
-	if (left.byteLength !== right.byteLength) return false;
-	return crypto.subtle.timingSafeEqual(left, right);
+/** Constant-time string comparison (hashes both inputs first to avoid length leaks). */
+export async function safeEqual(a: string, b: string): Promise<boolean> {
+	const [leftHash, rightHash] = await Promise.all([
+		crypto.subtle.digest("SHA-256", encoder.encode(a)),
+		crypto.subtle.digest("SHA-256", encoder.encode(b)),
+	]);
+	return crypto.subtle.timingSafeEqual(leftHash, rightHash);
 }

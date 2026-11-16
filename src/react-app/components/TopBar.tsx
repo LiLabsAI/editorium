@@ -1,28 +1,46 @@
+import { useEffect, useState } from "react";
 import { Link } from "react-router";
+
+import { api, type Me } from "../lib/api";
+import { pluralize } from "../lib/history";
 
 interface Crumb {
 	label: string;
 	to?: string;
 }
 
-/** Shared dark top bar: logo mark + breadcrumb slot + right action slot. */
+/** Shared dark top bar: logo mark + breadcrumb + live credits/usage + right actions. */
 export function TopBar({
 	projectName,
 	crumbs = [],
+	me,
 	actions,
 }: {
 	projectName: string;
 	crumbs?: Crumb[];
+	me?: Me | null;
 	actions?: React.ReactNode;
 }) {
+	const [openUsage, setOpenUsage] = useState(false);
+	const [usage, setUsage] = useState<{ balance: number; events: Array<{ reason: string; total: number; credits: number }> } | null>(
+		null,
+	);
+
+	useEffect(() => {
+		if (!openUsage) return;
+		api.usage().then(setUsage).catch(() => {});
+	}, [openUsage]);
+
 	return (
-		<header className="flex h-12 shrink-0 items-center gap-2 border-b ed-hairline px-4">
-			<Link to="/" className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground">
+		<header className="relative flex h-12 shrink-0 items-center gap-2 border-b ed-hairline px-4">
+			<Link
+				to="/"
+				aria-label="Home"
+				className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground"
+			>
 				<LogoMark />
 			</Link>
-			{crumbs.length > 0 && (
-				<span className="text-sm text-muted-foreground">/</span>
-			)}
+			{crumbs.length > 0 && <span className="text-sm text-muted-foreground">/</span>}
 			<span className="truncate text-sm text-muted-foreground">{projectName}</span>
 			{crumbs.map((crumb, i) => (
 				<span key={i} className="flex min-w-0 items-center gap-2">
@@ -36,7 +54,50 @@ export function TopBar({
 					)}
 				</span>
 			))}
-			<div className="ml-auto flex items-center gap-1.5">{actions}</div>
+			<div className="ml-auto flex items-center gap-1.5">
+				{actions}
+				{me?.user && (
+					<div className="relative">
+						<button
+							type="button"
+							onClick={() => setOpenUsage((v) => !v)}
+							aria-expanded={openUsage}
+							title="Credit balance and usage breakdown"
+							className="rounded-full border ed-hairline px-2.5 py-1 text-xs text-muted-foreground transition hover:bg-muted hover:text-foreground"
+						>
+							{pluralize(me.user.credits, "credit")}
+						</button>
+						{openUsage && (
+							<div
+								role="dialog"
+								aria-label="Usage details"
+								className="absolute right-0 top-9 z-40 w-64 rounded-xl border ed-hairline ed-panel p-3 text-xs shadow-2xl"
+							>
+								<div className="flex items-center justify-between font-medium">
+									<span>Credits</span>
+									<span>{usage?.balance ?? me.user.credits} remaining</span>
+								</div>
+								<div className="mt-2 space-y-1 border-t ed-hairline pt-2 text-muted-foreground">
+									{!usage ? (
+										<p>Loading…</p>
+									) : usage.events.length === 0 ? (
+										<p>No credit activity yet.</p>
+									) : (
+										usage.events.map((e) => (
+											<div key={e.reason} className="flex items-center justify-between">
+												<span className="truncate">{e.reason}</span>
+												<span className="tabular-nums">
+													{e.credits >= 0 ? `+${e.credits}` : e.credits} ({e.total})
+												</span>
+											</div>
+										))
+									)}
+								</div>
+							</div>
+						)}
+					</div>
+				)}
+			</div>
 		</header>
 	);
 }
@@ -65,6 +126,7 @@ export function PillButton({
 }) {
 	return (
 		<button
+			type="button"
 			title={title}
 			disabled={disabled}
 			onClick={onClick}
@@ -94,6 +156,7 @@ export function IconButton({
 }) {
 	return (
 		<button
+			type="button"
 			title={title}
 			aria-label={title}
 			aria-pressed={active}
@@ -107,4 +170,3 @@ export function IconButton({
 		</button>
 	);
 }
-

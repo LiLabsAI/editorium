@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router";
 
 import { api, describeError } from "../lib/api";
 import { LogoMark } from "../components/TopBar";
@@ -19,15 +20,15 @@ export function ClaimPage() {
 			window.location.assign("/");
 		} catch (err) {
 			setStatus("error");
-			setMessage(
-				err instanceof Error && err.message === "invalid_key" ? "That key isn't valid." : describeError(err),
-			);
+			setMessage(describeError(err));
 		}
 	}
 
 	return (
 		<div className="flex h-screen flex-col items-center justify-center gap-4 px-4">
-			<LogoMark />
+			<Link to="/" aria-label="Home" className="opacity-85 hover:opacity-100">
+				<LogoMark />
+			</Link>
 			<h1 className="text-lg font-semibold">Restore your account</h1>
 			<form onSubmit={submit} className="flex w-full max-w-sm flex-col gap-2">
 				<label htmlFor="claim-key" className="text-sm text-muted-foreground">
@@ -39,6 +40,7 @@ export function ClaimPage() {
 					autoComplete="off"
 					value={key}
 					onChange={(e) => setKey(e.target.value)}
+					aria-describedby={status === "error" ? "claim-error" : undefined}
 					className="rounded-xl border ed-hairline bg-card px-3 py-2 text-sm outline-none focus:border-ring"
 				/>
 				<button
@@ -49,11 +51,14 @@ export function ClaimPage() {
 					{status === "busy" ? "Checking…" : "Restore"}
 				</button>
 				{status === "error" && (
-					<p role="alert" className="text-sm text-red-300">
+					<p id="claim-error" role="alert" className="text-sm text-red-300">
 						{message}
 					</p>
 				)}
 			</form>
+			<Link to="/" className="text-xs text-muted-foreground hover:text-foreground">
+				Back to Dashboard
+			</Link>
 		</div>
 	);
 }

@@ -1,27 +1,25 @@
 /**
- * Fidelity guard (phase 4). Every AI result is compared with its source on a
- * 32×32 luma thumbnail before it may be saved. A result that drifted beyond
- * its operation class's budget fails the job (and is refunded) instead of
- * being stored as "your photo, edited".
- *
- * Budgets are calibrated on live outputs (plans/phase4): ESRGAN r=1.00,
- * background removal r=0.98 on the kept subject, a faithful FLUX edit r=0.99,
- * while unrelated images score r≤0.12.
- *
- * Reimagine also scores STRUCTURE (edge-map correlation), because a faithful
- * large recolour — a white shirt turned green over ~45% of the frame — moves
- * brightness enough to drop luma r to 0.37 (a false rejection, 2026-09-25),
- * while its edges still match (structure 0.58). Unrelated images fail both
- * (luma ≤0.07, structure ≤0.14).
+ * Fidelity guard (phase 4 + outpaint/style extensions). Every AI result is
+ * compared with its source before it may be saved. Drift beyond the class's
+ * budget fails the job (and is refunded) instead of saving a wrong image.
  */
 
 import type { PixelBox, PixelOps } from "./pixels";
 import { ProviderError } from "./providers/types";
 import type { Rgba } from "./png";
 
-export type OperationClass = "adjust" | "enhance" | "segment" | "local" | "reimagine" | "generate";
+export type OperationClass =
+	| "adjust"
+	| "enhance"
+	| "segment"
+	| "local"
+	| "outpaint"
+	| "style_transfer"
+	| "reimagine"
+	| "generate";
 
 const SIZE = 32;
+const HIGH_RES_LOCAL_SIZE = 64;
 
 export interface Similarity {
 	/** Pearson correlation of luma (structure). */
@@ -32,7 +30,7 @@ export interface Similarity {
 	n: number;
 	/** Fraction of compared pixels whose luma moved by more than OUTLIER_DELTA. */
 	outliers: number;
-	/** Reimagine only: edge-map correlation (colour/brightness-insensitive). */
+	/** Reimagine/style only: edge-map correlation (colour/brightness-insensitive). */
 	structure?: number;
 	/** The score that decided and is recorded on the version (0..1). */
 	fidelity: number;
@@ -41,29 +39,26 @@ export interface Similarity {
 interface Budget {
 	minR: number;
 	maxMad: number;
-	/** Local edits: a small change is diluted in an average, so outside the
-	 * region we also cap how many pixels may change noticeably. */
+	/** Local edits: outside the region we also cap how many pixels may change noticeably. */
 	maxOutliers?: number;
 }
 
 const OUTLIER_DELTA = 24;
 
-const BUDGETS: Record<Exclude<OperationClass, "generate" | "local">, Budget> = {
+const BUDGETS: Record<Exclude<OperationClass, "generate" | "local" | "outpaint" | "style_transfer">, Budget> = {
 	adjust: { minR: 0.9, maxMad: 40 },
 	enhance: { minR: 0.9, maxMad: 25 },
 	segment: { minR: 0.85, maxMad: 30 },
-	// Reimagine may change a lot, but a result unrelated to the photo means
-	// the model never saw it (the bug that produced a stranger's face). It
-	// passes on EITHER luma r ≥ 0.4 or structure ≥ REIMAGINE_MIN_STRUCTURE.
 	reimagine: { minR: 0.4, maxMad: 255 },
 };
 
-/** Structure floor for Reimagine: faithful recolour 0.58, unrelated ≤ 0.14. */
+/** Structure floor for Reimagine: faithful recolour 0.58, unrelated <= 0.14. */
 const REIMAGINE_MIN_STRUCTURE = 0.3;
-/** Structure is measured on a slightly larger thumbnail so edges survive. */
+const STYLE_MIN_STRUCTURE = 0.25;
 const STRUCTURE_SIZE = 48;
+const STYLE_STRUCTURE_SIZE = 24;
 
-/** Outside an edited region, only re-encoding noise is allowed. */
+/** Outside an edited region (or inside an outpaint), only re-encoding noise is allowed. */
 const LOCAL_OUTSIDE: Budget = { minR: 0.95, maxMad: 8, maxOutliers: 0.01 };
 
 function luma(img: Rgba, i: number): number {
@@ -97,8 +92,15 @@ export function similarity(a: Rgba, b: Rgba, include: (i: number) => boolean = (
 		mad += Math.abs(xs[i]! - ys[i]!);
 	}
 	mad /= n;
-	// Flat regions carry no structure: judge them on tone alone.
-	const r = sxx < 1e-6 || syy < 1e-6 ? (mad < 8 ? 1 : 0) : sxy / Math.sqrt(sxx * syy);
+	// Only both-flat regions carry no structure; flat -> noisy fails (r = 0).
+	const r =
+		sxx < 1e-6 && syy < 1e-6
+			? mad < 8
+				? 1
+				: 0
+			: sxx < 1e-6 || syy < 1e-6
+				? 0
+				: sxy / Math.sqrt(sxx * syy);
 	const rounded = Math.round(r * 1000) / 1000;
 	return {
 		r: rounded,
@@ -116,8 +118,10 @@ function gradients(img: Rgba): number[] {
 	const out: number[] = [];
 	for (let y = 0; y < img.height; y++) {
 		for (let x = 0; x < img.width; x++) {
-			const gx = at(x + 1, y - 1) + 2 * at(x + 1, y) + at(x + 1, y + 1) - at(x - 1, y - 1) - 2 * at(x - 1, y) - at(x - 1, y + 1);
-			const gy = at(x - 1, y + 1) + 2 * at(x, y + 1) + at(x + 1, y + 1) - at(x - 1, y - 1) - 2 * at(x, y - 1) - at(x + 1, y - 1);
+			const gx =
+				at(x + 1, y - 1) + 2 * at(x + 1, y) + at(x + 1, y + 1) - at(x - 1, y - 1) - 2 * at(x - 1, y) - at(x - 1, y + 1);
+			const gy =
+				at(x - 1, y + 1) + 2 * at(x, y + 1) + at(x + 1, y + 1) - at(x - 1, y - 1) - 2 * at(x, y - 1) - at(x + 1, y - 1);
 			out.push(Math.hypot(gx, gy));
 		}
 	}
@@ -126,8 +130,7 @@ function gradients(img: Rgba): number[] {
 
 /**
  * Structure similarity: correlation of edge maps. Insensitive to recolouring
- * and relighting (edges stay where they were), but an unrelated image —
- * e.g. a model that never saw the photo — has edges somewhere else.
+ * and relighting, while unrelated generations have edges elsewhere.
  */
 export function structureSimilarity(a: Rgba, b: Rgba): number {
 	const ga = gradients(a);
@@ -143,13 +146,31 @@ export function structureSimilarity(a: Rgba, b: Rgba): number {
 		saa += (ga[i]! - ma) ** 2;
 		sbb += (gb[i]! - mb) ** 2;
 	}
-	if (saa < 1e-6 || sbb < 1e-6) return saa < 1e-6 && sbb < 1e-6 ? 1 : 0;
+	if (saa < 1e-6 && sbb < 1e-6) return 1;
+	if (saa < 1e-6 || sbb < 1e-6) return 0;
 	return Math.round((sab / Math.sqrt(saa * sbb)) * 1000) / 1000;
 }
 
 export interface FidelityOptions {
 	/** Local edits: regions (normalized 0..1) that were allowed to change. */
 	regions?: Array<{ x: number; y: number; w: number; h: number }>;
+	/** Outpaint: original image's pixel rect inside `result`. */
+	outpaintBox?: PixelBox;
+}
+
+/** Verify result keeps the same aspect ratio (within 15% tolerance for model rounding). */
+async function checkAspect(ops: PixelOps, cls: OperationClass, source: ArrayBuffer, result: ArrayBuffer): Promise<void> {
+	try {
+		const [sd, dd] = await Promise.all([ops.dims(source), ops.dims(result)]);
+		if (sd.width > 0 && sd.height > 0 && dd.width > 0 && dd.height > 0) {
+			const ratio = (sd.width / sd.height) / (dd.width / dd.height);
+			if (ratio > 1.18 || ratio < 1 / 1.18) {
+				fail(cls, { r: 0, mad: 255, n: 0, outliers: 1, fidelity: 0 }, "result aspect ratio changed unexpectedly");
+			}
+		}
+	} catch {
+		// Ignore dims check failure when bytes aren't header-parseable; thumbnail check follows.
+	}
 }
 
 /**
@@ -164,37 +185,73 @@ export async function assertFidelity(
 	opts: FidelityOptions = {},
 ): Promise<Similarity | null> {
 	if (cls === "generate") return null;
+
+	if (cls === "outpaint") {
+		if (!opts.outpaintBox) throw new ProviderError("outpaint fidelity check missing inner box");
+		const innerResult = await ops.crop(result, opts.outpaintBox);
+		const [a, b] = await Promise.all([ops.thumbnail(source, SIZE), ops.thumbnail(innerResult.bytes, SIZE)]);
+		const score = similarity(a, b);
+		if (score.r < LOCAL_OUTSIDE.minR || score.mad > LOCAL_OUTSIDE.maxMad || score.outliers > (LOCAL_OUTSIDE.maxOutliers ?? 1)) {
+			fail(cls, score, "outpaint altered pixels inside the original photo");
+		}
+		return score;
+	}
+
+	await checkAspect(ops, cls, source, result);
 	const [a, b] = await Promise.all([ops.thumbnail(source, SIZE), ops.thumbnail(result, SIZE)]);
 
 	let score: Similarity;
 	let budget: Budget;
 	if (cls === "segment") {
-		// Only the kept subject must match; the background is gone by design.
+		let bgPixels = 0;
+		let srcBgPixels = 0;
+		for (let i = 0; i < SIZE * SIZE; i++) {
+			if (b.data[i * 4 + 3]! <= 128) bgPixels++;
+			if (a.data[i * 4 + 3]! <= 128) srcBgPixels++;
+		}
 		score = similarity(a, b, (i) => b.data[i * 4 + 3]! > 128);
 		if (score.n < SIZE * SIZE * 0.02) fail(cls, score, "nothing was kept as foreground");
+		if (srcBgPixels < SIZE * SIZE * 0.02 && bgPixels < SIZE * SIZE * 0.02) {
+			fail(cls, score, "background was not separated from the subject");
+		}
 		budget = BUDGETS.segment;
 	} else if (cls === "local") {
-		// Everything outside the (slightly grown) edited regions must be unchanged.
-		const outside = (i: number) => {
-			const x = ((i % SIZE) + 0.5) / SIZE;
-			const y = (Math.floor(i / SIZE) + 0.5) / SIZE;
-			const pad = 1.5 / SIZE;
+		const outsideMask = (size: number) => (i: number) => {
+			const x = ((i % size) + 0.5) / size;
+			const y = (Math.floor(i / size) + 0.5) / size;
+			const pad = 1.5 / size;
 			return !(opts.regions ?? []).some(
 				(r) => x >= r.x - pad && x <= r.x + r.w + pad && y >= r.y - pad && y <= r.y + r.h + pad,
 			);
 		};
-		score = similarity(a, b, outside);
+		score = similarity(a, b, outsideMask(SIZE));
+		if (score.n === 0) {
+			const [ha, hb] = await Promise.all([
+				ops.thumbnail(source, HIGH_RES_LOCAL_SIZE),
+				ops.thumbnail(result, HIGH_RES_LOCAL_SIZE),
+			]);
+			score = similarity(ha, hb, outsideMask(HIGH_RES_LOCAL_SIZE));
+		}
+		if (score.n === 0) {
+			// Region covered the entire photo — ensure the result isn't unrelated noise.
+			const [sa, sb] = await Promise.all([ops.thumbnail(source, STRUCTURE_SIZE), ops.thumbnail(result, STRUCTURE_SIZE)]);
+			const structure = structureSimilarity(sa, sb);
+			score = { ...similarity(a, b), structure };
+			if (score.r < 0.4 && (structure < REIMAGINE_MIN_STRUCTURE || score.r < 0)) {
+				fail(cls, score, "result drifted too far from the source photo");
+			}
+			return score;
+		}
 		budget = LOCAL_OUTSIDE;
-	} else if (cls === "reimagine") {
+	} else if (cls === "reimagine" || cls === "style_transfer") {
 		score = similarity(a, b);
-		budget = BUDGETS.reimagine;
-		const [sa, sb] = await Promise.all([ops.thumbnail(source, STRUCTURE_SIZE), ops.thumbnail(result, STRUCTURE_SIZE)]);
+		const structSize = cls === "style_transfer" ? STYLE_STRUCTURE_SIZE : STRUCTURE_SIZE;
+		const minStruct = cls === "style_transfer" ? STYLE_MIN_STRUCTURE : REIMAGINE_MIN_STRUCTURE;
+		const minR = cls === "style_transfer" ? -0.1 : BUDGETS.reimagine.minR;
+		const [sa, sb] = await Promise.all([ops.thumbnail(source, structSize), ops.thumbnail(result, structSize)]);
 		const structure = structureSimilarity(sa, sb);
 		score = { ...score, structure, fidelity: Math.max(score.fidelity, Math.max(0, structure)) };
-		// No brightness cap here: relighting (day → night) legitimately moves
-		// every pixel (mad 114 on a faithful edit). A blank or unrelated output
-		// still fails, because it matches neither tone nor edges.
-		const related = score.r >= budget.minR || structure >= REIMAGINE_MIN_STRUCTURE;
+		const related = score.r >= minR || (structure >= minStruct && score.r >= (cls === "style_transfer" ? -0.1 : -0.65));
 		if (!related) {
 			fail(cls, score, "result drifted too far from the source photo");
 		}
@@ -203,6 +260,7 @@ export async function assertFidelity(
 		score = similarity(a, b);
 		budget = BUDGETS[cls];
 	}
+
 	if (
 		score.r < budget.minR ||
 		score.mad > budget.maxMad ||
@@ -219,7 +277,7 @@ function fail(cls: OperationClass, score: Similarity, why: string): never {
 	throw new ProviderError(`fidelity_check_failed: ${why} (${cls}: r=${score.r}, mad=${score.mad}${structure})`);
 }
 
-/** Region (normalized) → pixel box within a width×height image. */
+/** Region (normalized) -> pixel box within a width×height image. */
 export function toPixelBox(
 	r: { x: number; y: number; w: number; h: number },
 	width: number,

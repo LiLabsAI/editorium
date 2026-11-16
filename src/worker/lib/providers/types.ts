@@ -1,7 +1,6 @@
 /**
  * Provider abstraction for every AI capability Editorium uses. The v1 binding
- * is Workers AI; heavier models (SAM-class masks, 4K upscale) can attach an
- * external provider behind the same interface without touching product code.
+ * is Workers AI; external/heavier models plug in behind this interface.
  */
 
 export interface DetectedBox {
@@ -26,16 +25,31 @@ export interface GeneratedImage {
 	height: number;
 }
 
+export type ClassifiedIntent =
+	| "edit_region"
+	| "remove_object"
+	| "outpaint"
+	| "enhance"
+	| "remove_bg"
+	| "reimagine"
+	| "generate"
+	| "describe"
+	| "answer";
+
+export interface IntentClassification {
+	intent: ClassifiedIntent;
+	targetObject?: string | null;
+	aspect?: string | null;
+	clarifiedPrompt?: string | null;
+}
+
 export interface AIProvider {
 	/** Detect salient objects: boxes + class labels. */
 	detect(image: ArrayBuffer, mime: string): Promise<DetectedBox[]>;
 
 	/** Person backstop: when the detector finds no person but the VLM sees
 	 * one, return an approximate normalized box (null if truly no person). */
-	locatePerson(
-		image: ArrayBuffer,
-		mime: string,
-	): Promise<DetectedBox | null>;
+	locatePerson(image: ArrayBuffer, mime: string): Promise<DetectedBox | null>;
 
 	/** VLM scene inventory: semantic regions (sky/water/ground/foliage…) with
 	 * their vertical band — regions object detectors cannot name. */
@@ -45,56 +59,56 @@ export interface AIProvider {
 	): Promise<Array<{ label: string; band: "top" | "middle" | "bottom" }>>;
 
 	/** Estimate head/eyes/mouth boxes INSIDE a person crop; boxes are relative
-	 * to the crop (0..1). AI-driven per the user requirement — no hardcoding. */
-	detectFaceDetails(
-		crop: ArrayBuffer,
-		mime: string,
-	): Promise<DetectedBox[]>;
+	 * to the crop (0..1). */
+	detectFaceDetails(crop: ArrayBuffer, mime: string): Promise<DetectedBox[]>;
 
-	/** Write a clean label + 1-2 sentence caption for a cropped region. */
+	/** Write a clean label + 1-2 sentence caption for a cropped region (or answer a question). */
 	captionRegion(
 		crop: ArrayBuffer,
 		mime: string,
 		hint: string,
 		position: string,
+		question?: string,
 	): Promise<RegionCaption>;
 
 	/** Text-to-image generation. */
-	textToImage(
-		prompt: string,
-		opts: { aspect?: string },
-	): Promise<GeneratedImage>;
+	textToImage(prompt: string, opts: { aspect?: string }): Promise<GeneratedImage>;
 
 	/**
-	 * Edit guided by a reference photo (phase 4). The reference must already
-	 * be downscaled to fit REFERENCE_MAX_PX (FLUX.2's input limit); the
-	 * provider MUST condition on it — never fall back to text-only generation.
-	 * `dims` is the aspect-preserving output size (see editDims).
+	 * Edit guided by a primary reference photo + optional extra style/subject
+	 * references (`input_image_1..3` on FLUX.2). References must be < 512px.
 	 */
 	editWithReference(
 		reference: { bytes: ArrayBuffer; mime: string },
 		prompt: string,
 		dims: { width: number; height: number },
+		extraReferences?: Array<{ bytes: ArrayBuffer; mime: string }>,
 	): Promise<GeneratedImage & { model: string }>;
 
-	/** Rewrite casual user text into a structured generation prompt. */
-	rewritePrompt(
+	/** Primary whole-photo edit (e.g. Pruna P-Image-Edit) taking URL or data URI sources. */
+	editWithPrimary?(
+		sources: string[],
+		prompt: string,
+		aspectRatio: string,
+	): Promise<{ data: ArrayBuffer; mime: string; model: string } | null>;
+
+	/** Classify natural-language intent into an editor action. */
+	classifyIntent?(
 		text: string,
-		operation: string,
-		context: string,
-	): Promise<string>;
+		context: { hasTarget: boolean; segmentLabels: string[] },
+	): Promise<IntentClassification | null>;
+
+	/** Rewrite casual user text into a structured generation prompt. */
+	rewritePrompt(text: string, operation: string, context: string): Promise<string>;
 
 	/** Chat completion with streaming text deltas. */
-	streamChat(
-		messages: Array<{ role: string; content: string }>,
-	): Promise<ReadableStream<string>>;
+	streamChat(messages: Array<{ role: string; content: string }>): Promise<ReadableStream<string>>;
 }
 
 /**
  * Output size for image-edit models: preserve the source aspect ratio, fit the
  * longest side to `maxSide`, round to multiples of 16 (diffusion latents),
- * clamp each side to [256, maxSide]. The old code clamped width and height
- * independently, turning every large photo into a 1024x1024 square.
+ * clamp each side to [256, maxSide].
  */
 export function editDims(
 	width: number,
@@ -117,15 +131,36 @@ export function referenceDims(width: number, height: number): { width: number; h
 	return { width: Math.max(1, Math.floor(width * scale)), height: Math.max(1, Math.floor(height * scale)) };
 }
 
-/** Pruna P-Image-Edit only accepts these ratios; pick the closest. */
-export const PRUNA_ASPECTS = ["1:1", "16:9", "9:16", "4:3", "3:4"] as const;
+/** Aspect presets shared by T2I and reference-edit adapters. */
+export function aspectSize(aspect: string): [number, number] {
+	switch (aspect) {
+		case "16:9":
+			return [1024, 576];
+		case "9:16":
+			return [576, 1024];
+		case "4:3":
+			return [1024, 768];
+		case "3:4":
+			return [768, 1024];
+		case "3:2":
+			return [1024, 688];
+		case "2:3":
+			return [688, 1024];
+		default:
+			return [1024, 1024];
+	}
+}
 
-export function closestAspect(width: number, height: number): (typeof PRUNA_ASPECTS)[number] {
+/** Pruna P-Image-Edit accepted ratios (supports match_input_image plus explicit ratios). */
+export const PRUNA_ASPECTS = ["match_input_image", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"] as const;
+const RATIO_CHOICES = ["1:1", "16:9", "9:16", "4:3", "3:4"] as const;
+
+export function closestAspect(width: number, height: number): (typeof RATIO_CHOICES)[number] {
 	if (!(width > 0 && height > 0)) return "1:1";
 	const target = Math.log(width / height);
-	let best: (typeof PRUNA_ASPECTS)[number] = "1:1";
+	let best: (typeof RATIO_CHOICES)[number] = "1:1";
 	let bestDiff = Infinity;
-	for (const aspect of PRUNA_ASPECTS) {
+	for (const aspect of RATIO_CHOICES) {
 		const [a, b] = aspect.split(":").map(Number) as [number, number];
 		const diff = Math.abs(Math.log(a / b) - target);
 		if (diff < bestDiff) {
@@ -135,7 +170,6 @@ export function closestAspect(width: number, height: number): (typeof PRUNA_ASPE
 	}
 	return best;
 }
-
 
 export class ProviderError extends Error {
 	constructor(

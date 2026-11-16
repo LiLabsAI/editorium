@@ -25,6 +25,7 @@ export default defineConfig({
 					},
 				},
 				wrangler: { configPath: "./wrangler.json" },
+				remoteBindings: false,
 			};
 		}),
 	],

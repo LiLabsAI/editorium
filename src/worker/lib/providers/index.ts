@@ -15,11 +15,14 @@ export function getProvider(env: Env): AIProvider {
 	}
 	return new WorkersAIProvider(env.AI, {
 		moondream: env.MODEL_DETECT_MOONDREAM,
+		detr: env.MODEL_DETECT_DETR,
 		vlm: env.MODEL_VLM,
 		vlmSecondary: env.MODEL_VLM_SECONDARY,
 		t2i: env.MODEL_T2I,
 		llm: env.MODEL_LLM,
+		router: env.MODEL_ROUTER,
 		edit: env.MODEL_EDIT,
+		editPrimary: env.MODEL_EDIT_PRIMARY,
 	});
 }
 

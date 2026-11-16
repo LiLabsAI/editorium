@@ -1,8 +1,7 @@
 /**
- * Minimal PNG codec (pure TS, WebCrypto-free): encode 8-bit gray/RGB/RGBA and
- * decode 8-bit gray, gray+alpha, RGB, RGBA and palette PNGs to RGBA. Used for
- * masks, fidelity thumbnails (the Images binding emits palette PNGs for
- * images with alpha) and the offline test pixel pipeline.
+ * Minimal PNG codec (pure TS): encode 8-bit gray/RGB/RGBA and decode 8-bit
+ * gray, gray+alpha, RGB, RGBA and palette PNGs to RGBA. Used for masks,
+ * fidelity thumbnails, and the offline test pixel pipeline.
  */
 
 export interface Rgba {
@@ -11,6 +10,9 @@ export interface Rgba {
 	/** Row-major RGBA, 4 bytes per pixel. */
 	data: Uint8Array;
 }
+
+const PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] as const;
+const MAX_DECODE_PIXELS = 25_000_000;
 
 const CRC_TABLE = (() => {
 	const table = new Uint32Array(256);
@@ -39,8 +41,14 @@ function chunk(type: string, data: Uint8Array): Uint8Array {
 }
 
 async function pipe(bytes: Uint8Array, stream: CompressionStream | DecompressionStream): Promise<Uint8Array> {
-	const piped = new Blob([bytes]).stream().pipeThrough(stream);
-	return new Uint8Array(await new Response(piped).arrayBuffer());
+	// Stream directly without copying into a Blob (saves peak memory in 128 MB isolates).
+	const readable = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(bytes);
+			controller.close();
+		},
+	}).pipeThrough(stream);
+	return new Uint8Array(await new Response(readable).arrayBuffer());
 }
 
 /** Encode 8-bit pixels (`channels` bytes per pixel) as PNG. */
@@ -64,7 +72,7 @@ export async function encodePng(
 	ihdr[8] = 8;
 	ihdr[9] = channels === 1 ? 0 : channels === 3 ? 2 : 6;
 	const parts = [
-		new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+		new Uint8Array(PNG_SIG),
 		chunk("IHDR", ihdr),
 		chunk("IDAT", idat),
 		chunk("IEND", new Uint8Array(0)),
@@ -88,7 +96,9 @@ const CHANNELS: Record<number, number> = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
 export async function decodePng(buffer: ArrayBuffer): Promise<Rgba> {
 	const bytes = new Uint8Array(buffer);
 	const view = new DataView(buffer);
-	if (bytes.length < 33 || view.getUint32(0) !== 0x89504e47) throw new Error("not a PNG");
+	if (bytes.length < 33 || !PNG_SIG.every((b, i) => bytes[i] === b)) {
+		throw new Error("not a PNG");
+	}
 	let offset = 8;
 	let width = 0;
 	let height = 0;
@@ -96,13 +106,18 @@ export async function decodePng(buffer: ArrayBuffer): Promise<Rgba> {
 	let palette: Uint8Array | null = null;
 	let transparency: Uint8Array | null = null;
 	const idat: Uint8Array[] = [];
-	while (offset + 8 <= bytes.length) {
+	while (offset + 12 <= bytes.length) {
 		const length = view.getUint32(offset);
+		if (length > bytes.length - offset - 12) throw new Error("truncated PNG chunk");
 		const type = String.fromCharCode(...bytes.subarray(offset + 4, offset + 8));
 		const data = bytes.subarray(offset + 8, offset + 8 + length);
 		if (type === "IHDR") {
+			if (length < 13) throw new Error("invalid IHDR");
 			width = view.getUint32(offset + 8);
 			height = view.getUint32(offset + 12);
+			if (width === 0 || height === 0 || width * height > MAX_DECODE_PIXELS) {
+				throw new Error("unsupported PNG dimensions");
+			}
 			if (data[8] !== 8 || data[12] !== 0) throw new Error("unsupported PNG (bit depth/interlace)");
 			colorType = data[9]!;
 		} else if (type === "PLTE") palette = data;
@@ -121,6 +136,7 @@ export async function decodePng(buffer: ArrayBuffer): Promise<Rgba> {
 	}
 	const raw = await pipe(joined, new DecompressionStream("deflate"));
 	const stride = width * channels;
+	if (raw.length < (stride + 1) * height) throw new Error("truncated PNG image data");
 	const px = new Uint8Array(stride * height);
 	let p = 0;
 	for (let y = 0; y < height; y++) {
@@ -143,6 +159,12 @@ export async function decodePng(buffer: ArrayBuffer): Promise<Rgba> {
 			px[row + x] = v & 0xff;
 		}
 	}
+	const trnsGray = colorType === 0 && transparency && transparency.length >= 2 ? transparency[1]! : null;
+	const trnsRgb =
+		colorType === 2 && transparency && transparency.length >= 6
+			? [transparency[1]!, transparency[3]!, transparency[5]!]
+			: null;
+
 	const out = new Uint8Array(width * height * 4);
 	for (let i = 0; i < width * height; i++) {
 		const o = i * 4;
@@ -154,13 +176,22 @@ export async function decodePng(buffer: ArrayBuffer): Promise<Rgba> {
 			out[o + 2] = palette?.[k * 3 + 2] ?? 0;
 			out[o + 3] = transparency && k < transparency.length ? transparency[k]! : 255;
 		} else if (channels <= 2) {
-			out[o] = out[o + 1] = out[o + 2] = px[s]!;
-			out[o + 3] = channels === 2 ? px[s + 1]! : 255;
+			const g = px[s]!;
+			out[o] = out[o + 1] = out[o + 2] = g;
+			out[o + 3] = channels === 2 ? px[s + 1]! : trnsGray !== null && g === trnsGray ? 0 : 255;
 		} else {
-			out[o] = px[s]!;
-			out[o + 1] = px[s + 1]!;
-			out[o + 2] = px[s + 2]!;
-			out[o + 3] = channels === 4 ? px[s + 3]! : 255;
+			const r = px[s]!;
+			const g = px[s + 1]!;
+			const b = px[s + 2]!;
+			out[o] = r;
+			out[o + 1] = g;
+			out[o + 2] = b;
+			out[o + 3] =
+				channels === 4
+					? px[s + 3]!
+					: trnsRgb && r === trnsRgb[0] && g === trnsRgb[1] && b === trnsRgb[2]
+						? 0
+						: 255;
 		}
 	}
 	return { width, height, data: out };

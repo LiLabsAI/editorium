@@ -88,6 +88,8 @@ export const images = sqliteTable(
 		currentVersionId: text("current_version_id"),
 		filenameLabel: text("filename_label").notNull(),
 		bookmarkedAt: integer("bookmarked_at", { mode: "timestamp_ms" }),
+		adjustmentsJson: text("adjustments_json"),
+		overlayR2Key: text("overlay_r2_key"),
 		segmentStatus: text("segment_status", {
 			enum: ["none", "pending", "partial", "ready", "failed"],
 		})
@@ -128,6 +130,7 @@ export const imageVersions = sqliteTable(
 	opClass: text("op_class"),
 	model: text("model"),
 	fidelity: real("fidelity"),
+	adjustmentsJson: text("adjustments_json"),
 	createdAt: integer("created_at", { mode: "timestamp_ms" })
 		.notNull()
 		.default(now),
@@ -247,7 +250,8 @@ export const editInstructions = sqliteTable(
 	bboxY: real("bbox_y").notNull(),
 	bboxW: real("bbox_w").notNull(),
 	bboxH: real("bbox_h").notNull(),
-	status: text("status", { enum: ["pending", "applied"] })
+	maskR2Key: text("mask_r2_key"),
+	status: text("status", { enum: ["pending", "applying", "applied"] })
 		.notNull()
 		.default("pending"),
 	resultImageId: text("result_image_id"),
@@ -263,7 +267,7 @@ export const jobs = sqliteTable(
 	{
 	id: text("id").primaryKey(),
 	type: text("type", {
-		enum: ["segment", "generate", "enhance", "inpaint", "caption", "thumb", "batch_edit", "remove_bg"],
+		enum: ["segment", "generate", "enhance", "inpaint", "outpaint", "caption", "thumb", "batch_edit", "remove_bg"],
 	}).notNull(),
 	userId: text("user_id").notNull(),
 	imageId: text("image_id"),
@@ -313,20 +317,49 @@ export const imagePalettes = sqliteTable(
 		.default("image"),
 	segmentId: text("segment_id"),
 	},
-	(t) => [index("image_palettes_image_idx").on(t.imageId)],
+	(t) => [
+		index("image_palettes_image_idx").on(t.imageId),
+		uniqueIndex("image_palettes_unique").on(t.imageId, t.paletteId),
+	],
 );
 
-export const references = sqliteTable("references", {
-	id: text("id").primaryKey(),
-	projectId: text("project_id")
-		.notNull()
-		.references(() => projects.id, { onDelete: "cascade" }),
-	r2KeyThumb: text("r2_key_thumb").notNull(),
-	kind: text("kind").notNull().default("image"),
-	createdAt: integer("created_at", { mode: "timestamp_ms" })
-		.notNull()
-		.default(now),
-});
+export const references = sqliteTable(
+	"references",
+	{
+		id: text("id").primaryKey(),
+		projectId: text("project_id")
+			.notNull()
+			.references(() => projects.id, { onDelete: "cascade" }),
+		title: text("title").notNull().default("Reference"),
+		r2KeyFull: text("r2_key_full"),
+		r2KeyThumb: text("r2_key_thumb").notNull(),
+		mime: text("mime").notNull().default("image/png"),
+		widthPx: integer("width_px").notNull().default(0),
+		heightPx: integer("height_px").notNull().default(0),
+		kind: text("kind").notNull().default("image"),
+		createdAt: integer("created_at", { mode: "timestamp_ms" })
+			.notNull()
+			.default(now),
+	},
+	(t) => [index("references_project_idx").on(t.projectId)],
+);
+
+/** Non-job AI calls (chat answers, descriptions, prompt rewrites) counted in the
+ * D1 per-minute AI quota alongside jobs. */
+export const aiRequests = sqliteTable(
+	"ai_requests",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		kind: text("kind").notNull(),
+		createdAt: integer("created_at", { mode: "timestamp_ms" })
+			.notNull()
+			.default(now),
+	},
+	(t) => [index("ai_requests_user_created_idx").on(t.userId, t.createdAt)],
+);
 
 export const shareLinks = sqliteTable(
 	"share_links",
@@ -398,4 +431,5 @@ export type ChatMessage = typeof chatMessages.$inferSelect;
 export type Job = typeof jobs.$inferSelect;
 export type EditInstruction = typeof editInstructions.$inferSelect;
 export type Palette = typeof palettes.$inferSelect;
+export type Reference = typeof references.$inferSelect;
 export type ShareLink = typeof shareLinks.$inferSelect;

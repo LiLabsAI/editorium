@@ -5,6 +5,7 @@ import { secureHeaders } from "hono/secure-headers";
 import { createDb } from "./lib/db";
 import { onError } from "./lib/http";
 import { api } from "./routes/api";
+import { UserEventsDO } from "./events";
 import { handleQueue, type AiJobMessage } from "./queue";
 import { SegmentWorkflow } from "./workflows";
 
@@ -43,6 +44,6 @@ export default {
 	queue: (batch: MessageBatch<AiJobMessage>, env: Env) => handleQueue(batch, env),
 } satisfies ExportedHandler<Env, AiJobMessage>;
 
-export { SegmentWorkflow };
+export { SegmentWorkflow, UserEventsDO };
 
 export type { AiJobMessage };

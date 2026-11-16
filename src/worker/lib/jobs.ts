@@ -11,7 +11,8 @@ export type JobType =
 	| "caption"
 	| "thumb"
 	| "batch_edit"
-	| "remove_bg";
+	| "remove_bg"
+	| "outpaint";
 
 /** The ONE credit price list. Charges and refunds both read it (previously
  * three diverging copies meant failed batch edits were never refunded). */
@@ -21,6 +22,7 @@ export const CREDIT_COSTS: Record<JobType, number> = {
 	enhance: 3,
 	batch_edit: 2,
 	remove_bg: 1,
+	outpaint: 2,
 	segment: 0,
 	caption: 0,
 	thumb: 0,

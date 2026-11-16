@@ -11,11 +11,22 @@ export function mediaKeys(userId: string, albumId: string, imageId: string) {
 		original: (ext: string) => `${base}/original.${ext}`,
 		web: `${base}/web.webp`,
 		thumb: `${base}/thumb.webp`,
+		overlay: `${base}/overlay.png`,
 		version: (versionId: string, ext: string) => `${base}/v/${versionId}/full.${ext}`,
 		versionWeb: (versionId: string) => `${base}/v/${versionId}/web.webp`,
 		versionThumb: (versionId: string) => `${base}/v/${versionId}/thumb.webp`,
 		segmentMask: (segmentId: string) => `${base}/seg/${segmentId}/mask.png`,
 		segmentCrop: (segmentId: string) => `${base}/seg/${segmentId}/crop.png`,
+		instructionMask: (instructionId: string) => `${base}/inst/${instructionId}/mask.png`,
+	};
+}
+
+export function referenceKeys(userId: string, refId: string) {
+	const base = `u/${userId}/ref/${refId}`;
+	return {
+		prefix: `${base}/`,
+		full: (ext: string) => `${base}/full.${ext}`,
+		thumb: `${base}/thumb.webp`,
 	};
 }
 
@@ -134,15 +145,23 @@ export async function putObject(
 	});
 }
 
+function etagMatches(ifNoneMatch: string | null | undefined, httpEtag: string): boolean {
+	if (!ifNoneMatch) return false;
+	const normalize = (v: string) => v.trim().replace(/^W\//i, "");
+	const target = normalize(httpEtag);
+	return ifNoneMatch.split(",").some((part) => part.trim() === "*" || normalize(part) === target);
+}
+
 /**
- * Serve an R2 object with hardening headers. Anything that is not a known
- * raster image (legacy SVG, octet-stream fallbacks) is forced to download
- * and sandboxed, so stored content can never execute in the app's origin.
+ * Serve an R2 object with hardening headers and conditional 304 ETag support.
+ * Anything that is not a known raster image (legacy SVG, octet-stream
+ * fallbacks) is forced to download and sandboxed, so stored content can never
+ * execute in the app's origin.
  */
 export async function getObject(
 	bucket: R2Bucket,
 	key: string,
-	opts: { cacheControl?: string } = {},
+	opts: { cacheControl?: string; ifNoneMatch?: string | null } = {},
 ): Promise<Response | null> {
 	const obj = await bucket.get(key);
 	if (!obj) return null;
@@ -152,6 +171,10 @@ export async function getObject(
 	headers.set("Cache-Control", opts.cacheControl ?? obj.httpMetadata?.cacheControl ?? MEDIA_CACHE);
 	headers.set("X-Content-Type-Options", "nosniff");
 	headers.set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox");
+	if (etagMatches(opts.ifNoneMatch, obj.httpEtag)) {
+		await obj.body?.cancel();
+		return new Response(null, { status: 304, headers });
+	}
 	if (!isRasterMime(obj.httpMetadata?.contentType)) {
 		headers.set("Content-Type", "application/octet-stream");
 		headers.set("Content-Disposition", "attachment");

@@ -120,6 +120,7 @@
 /* ---- Editorium dark theme (matches reference: near-black canvas,
        #1e1e1e panels, hairline borders, indigo selection accent) ---- */
 :root, .dark {
+    color-scheme: dark;
     --background: oklch(0.145 0 0);
     --foreground: oklch(0.97 0 0);
     --card: oklch(0.205 0 0);

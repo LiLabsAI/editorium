@@ -1,8 +1,10 @@
 import { decodePng, encodePng } from "../png";
 import {
+	aspectSize,
 	type AIProvider,
 	type DetectedBox,
 	type GeneratedImage,
+	type IntentClassification,
 	type RegionCaption,
 	ProviderError,
 } from "./types";
@@ -11,8 +13,6 @@ import {
  * Deterministic offline provider for tests and CI (AI_MOCK=true). Every image
  * it returns is a real PNG — the pipeline stores only sniffed raster formats,
  * so mock output goes through exactly the same path as model output.
- * Images are rendered at 1/8 of the requested size to keep tests fast; the
- * aspect ratio is preserved.
  */
 
 const SCALE = 8;
@@ -85,8 +85,12 @@ export class MockProvider implements AIProvider {
 		_mime: string,
 		hint: string,
 		position: string,
+		question?: string,
 	): Promise<RegionCaption> {
 		const label = hint || "object";
+		if (question) {
+			return { label, caption: `This photo shows a ${label} ${position} (answering: ${question}).` };
+		}
 		return { label, caption: `A ${label} ${position}.` };
 	}
 
@@ -95,15 +99,18 @@ export class MockProvider implements AIProvider {
 		return png(w, h, prompt);
 	}
 
-	/** Mock reference edit: a hue-shifted copy of the (PNG) reference at
-	 * `dims`, so results stay faithful to the input like a working model.
+	/**
+	 * Mock reference edit: a hue-shifted copy of the (PNG) reference at `dims`.
 	 * `__mock_ignore_input__` simulates a model that ignores its input;
-	 * `__mock_fail__` simulates a model error. */
+	 * `__mock_fail__` simulates a model error.
+	 */
 	async editWithReference(
 		reference: { bytes: ArrayBuffer; mime: string },
 		prompt: string,
 		dims: { width: number; height: number },
+		_extraReferences: Array<{ bytes: ArrayBuffer; mime: string }> = [],
 	): Promise<GeneratedImage & { model: string }> {
+		void _extraReferences;
 		if (prompt.includes("__mock_fail__")) throw new ProviderError("mock failure");
 		if (prompt.includes("__mock_ignore_input__")) {
 			return { ...(await noise(dims.width, dims.height)), model: "mock:edit" };
@@ -119,10 +126,15 @@ export class MockProvider implements AIProvider {
 				out[o] = Math.min(255, src.data[s]! + 20);
 				out[o + 1] = src.data[s + 1]!;
 				out[o + 2] = Math.max(0, src.data[s + 2]! - 20);
-				out[o + 3] = 255;
+				out[o + 3] = src.data[s + 3] ?? 255;
 			}
 		}
 		return { data: await encodePng(w, h, 4, out), mime: "image/png", width: w, height: h, model: "mock:edit" };
+	}
+
+	async classifyIntent(): Promise<IntentClassification | null> {
+		// Null falls back to deterministic rule router in mock mode so tests remain fast & exact.
+		return null;
 	}
 
 	async rewritePrompt(text: string, operation: string): Promise<string> {
@@ -154,21 +166,6 @@ export function mockReply(userText: string): string {
 		return "Generating a new image from your description.";
 	}
 	return "I can generate images, enhance them, or edit a region you select in the editor.";
-}
-
-function aspectSize(aspect: string): [number, number] {
-	switch (aspect) {
-		case "16:9":
-			return [1024, 576];
-		case "9:16":
-			return [576, 1024];
-		case "4:3":
-			return [1024, 768];
-		case "3:4":
-			return [768, 1024];
-		default:
-			return [1024, 1024];
-	}
 }
 
 function hashHue(text: string): number {

@@ -9,7 +9,7 @@
  * the timeline is read.
  */
 
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 
 import {
 	chatMessages,
@@ -27,7 +27,17 @@ import { CREDIT_COSTS, type JobType } from "./jobs";
 type Db = ReturnType<typeof createDb>;
 export type Box = { x: number; y: number; w: number; h: number };
 
-export type OpClass = "adjust" | "enhance" | "segment" | "local" | "reimagine" | "generate" | "answer" | "upload";
+export type OpClass =
+	| "adjust"
+	| "enhance"
+	| "segment"
+	| "local"
+	| "reimagine"
+	| "style_transfer"
+	| "outpaint"
+	| "generate"
+	| "answer"
+	| "upload";
 
 export function familyRoot(image: Pick<ImageRow, "id" | "rootImageId">): string {
 	return image.rootImageId ?? image.id;
@@ -145,12 +155,16 @@ export function friendlyError(raw: string | null): string {
 	return "Something went wrong. Try again.";
 }
 
+const STALE_RUNNING_MS = 90_000;
+
 const OPERATION_CLASS: Record<string, OpClass> = {
 	filter: "adjust",
 	enhance: "enhance",
 	remove_bg: "segment",
 	generate: "generate",
 	edit: "reimagine",
+	style_transfer: "style_transfer",
+	outpaint: "outpaint",
 	upload: "upload",
 	duplicate: "upload",
 };
@@ -176,7 +190,7 @@ export async function familyHistory(env: Env, image: ImageRow): Promise<{ rootIm
 			.from(chatMessages)
 			.innerJoin(chatThreads, eq(chatThreads.id, chatMessages.threadId))
 			.where(and(eq(chatMessages.rootImageId, root), eq(chatThreads.albumId, image.albumId)))
-			.orderBy(asc(chatMessages.createdAt)),
+			.orderBy(asc(chatMessages.createdAt), asc(sql`"chat_messages"."rowid"`)),
 		db
 			.select({ image: images, version: imageVersions })
 			.from(images)
@@ -206,6 +220,7 @@ export async function familyHistory(env: Env, image: ImageRow): Promise<{ rootIm
 		};
 	};
 
+	const nowMs = Date.now();
 	const turns: HistoryTurn[] = [];
 	const seenResults = new Set<string>();
 	for (const request of msgs) {
@@ -216,8 +231,17 @@ export async function familyHistory(env: Env, image: ImageRow): Promise<{ rootIm
 		if (resultImageId) seenResults.add(resultImageId);
 
 		let status: TurnStatus = "done";
-		if (job) status = job.status;
-		else if (!reply || (!reply.text && !reply.resultImageId)) status = "running"; // answer still streaming
+		let staleError: string | null = null;
+		if (job) {
+			status = job.status;
+		} else if (!reply || (!reply.text && !reply.resultImageId)) {
+			if (nowMs - request.createdAt.getTime() > STALE_RUNNING_MS) {
+				status = "error";
+				staleError = "The response was interrupted. Try asking again.";
+			} else {
+				status = "running"; // answer still streaming
+			}
+		}
 
 		const cost = job ? (CREDIT_COSTS[job.type as JobType] ?? 0) : 0;
 		turns.push({
@@ -233,7 +257,7 @@ export async function familyHistory(env: Env, image: ImageRow): Promise<{ rootIm
 			reply: {
 				status,
 				text: reply?.text ?? "",
-				error: status === "error" ? friendlyError(job?.error ?? null) : null,
+				error: status === "error" ? (staleError ?? friendlyError(job?.error ?? null)) : null,
 				credits: cost,
 				refunded: status === "error" && cost > 0 && (job?.creditsCharged ?? 0) === 0,
 				result: status === "done" ? resultOf(resultImageId) : null,

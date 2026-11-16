@@ -1,12 +1,14 @@
-# E2E: editor tools
+# E2E: editor studio tools (Adjustments, Wand, Lasso, Outpaint, Batch Chips, Text)
 
-1. MARQUEE tool: drag across two regions
-   ASSERT: both rows highlighted; bulk bar shows "2 selected"
-   CLICK "Lock all" -> padlocks visible; "Delete all" -> rows removed
-2. PEN tool: draw a closed loop on an empty area
-   ASSERT: "custom region" appears in the tree; select + prompt + regenerate works
-3. TEXT tool: click canvas, type text
-   ASSERT: annotation renders at the click point; persists after reload
-4. DUPLICATE: album gains "<label> copy" and the editor navigates to it
-5. IMAGES: switcher overlay lists album images; picking one swaps the editor
-6. FULLSCREEN: chrome hides; Esc restores
+1. Open /albums/:albumId/images/:imageId and click "Adjust" in toolbar
+2. Adjust Exposure, Warmth, Clarity, Rotate 90°, or Crop corners (C tool)
+   ASSERT: WebGL2 viewport updates live at 60fps; click "Bake to new branch" creates a free branched photo
+3. Select Wand (W) and click a distinct object; toggle "+ Queue chip", type edit, press Enter
+   SELECT Lasso (L), draw closed polygon, type second edit, press Enter
+   ASSERT: Batch queue shows "Queued edits (2/5)"; clicking "Apply all (2 credits)" runs 1 batched pass
+4. Select Extend / Outpaint (O), drag right/bottom handle outward, enter optional prompt, click "Extend"
+   ASSERT: Expanded photo preserves original pixels cleanly inside the frame
+5. Select Text (T), click canvas, enter caption + pick color -> click "Place"
+   ASSERT: annotation renders over image and is composited into Download and Share files
+6. Select a layer in Layers drawer -> click Lock 🔒 -> type chat edit
+   ASSERT: assistant notifies layer is locked without spending credits

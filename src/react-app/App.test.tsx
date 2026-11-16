@@ -1,10 +1,9 @@
-import { render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Dashboard } from "./pages/Dashboard";
 import { SharePage } from "./pages/SharePage";
-import { Route, Routes } from "react-router";
 
 function stubFetch(routes: Record<string, unknown>): ReturnType<typeof vi.fn> {
 	return vi.fn(async (input: RequestInfo | URL) => {
@@ -15,7 +14,10 @@ function stubFetch(routes: Record<string, unknown>): ReturnType<typeof vi.fn> {
 	});
 }
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+	cleanup();
+	vi.unstubAllGlobals();
+});
 
 describe("Dashboard", () => {
 	it("renders the workspace hero, tabs and album cards", async () => {
@@ -78,5 +80,50 @@ describe("SharePage", () => {
 		expect(screen.getByRole("link", { name: "Download" }).getAttribute("href")).toBe(
 			"/api/public/share/tok123/file?variant=original",
 		);
+	});
+
+	it("shows expired view cleanly when share fails", async () => {
+		vi.stubGlobal("fetch", stubFetch({}));
+		render(
+			<MemoryRouter initialEntries={["/s/badtoken"]}>
+				<Routes>
+					<Route path="/s/:token" element={<SharePage />} />
+				</Routes>
+			</MemoryRouter>,
+		);
+		expect(await screen.findByText(/expired or was revoked/)).toBeInTheDocument();
+	});
+
+	it("switches to References tab on Dashboard and lists project references", async () => {
+		vi.stubGlobal(
+			"fetch",
+			stubFetch({
+				"/api/albums": { project: { id: "p1", name: "Studio" }, albums: [] },
+				"/api/references": {
+					references: [
+						{
+							id: "ref1",
+							projectId: "p1",
+							title: "Film Grain",
+							r2KeyFull: "k1",
+							r2KeyThumb: "k2",
+							mime: "image/png",
+							widthPx: 800,
+							heightPx: 600,
+							kind: "image",
+							createdAt: new Date().toISOString(),
+						},
+					],
+				},
+			}),
+		);
+		render(
+			<MemoryRouter>
+				<Dashboard me={{ user: { id: "u1", name: "Guest", plan: "free", credits: 20 }, project: { id: "p1", name: "Studio" } }} />
+			</MemoryRouter>,
+		);
+		fireEvent.click(screen.getByRole("button", { name: "References" }));
+		expect(await screen.findByText("Film Grain")).toBeInTheDocument();
+		expect(screen.getByText("800 × 600")).toBeInTheDocument();
 	});
 });

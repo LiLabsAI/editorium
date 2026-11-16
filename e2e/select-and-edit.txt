@@ -1,21 +1,13 @@
-# E2E: select a recognized region and edit it (phase-2 core loop)
-# Setup: pnpm dev (port 5173), album with an uploaded image, recognition ready.
-# Run: browser agent, mock AI (AI_MOCK=true) for determinism.
+# E2E: select region / subject mask and edit non-destructively
+# Setup: pnpm dev, album with an uploaded image
 
 1. Open /albums/:albumId/images/:imageId
-2. WAIT for element tree rows to appear (segments ready)
-3. HOVER over a mid-image region
-   ASSERT: hairline box + label chip appear under the cursor
-4. CLICK the region
-   ASSERT: blue box with 8 handles; tree row highlighted indigo;
-           floating Prompt card anchored beside the box with the caption
-5. CLICK the caption, type a new prompt ("golden autumn colors")
-   CLICK "Save prompt" -> tree row gains the "A" badge
-6. CLICK "Regenerate region"
-   ASSERT: progress state ("Queued…" / "Regenerating…")
-   WAIT for job done (button returns / toast)
-   ASSERT: only the region changed; version dropdown gains "Edited <label>"
-7. CLICK Undo
-   ASSERT: pixels revert to the previous version (region patch gone)
-8. CLICK Redo
-   ASSERT: edited pixels return
+2. CLICK "✨ Subject" in the canvas toolbar (or click Layers -> "✨ Select subject")
+   ASSERT: BiRefNet foreground cutout loads as translucent indigo mask overlay; composer badge displays "Subject · <region>"
+3. CLICK Brush (B) or Eraser (E) tool and paint/refine the mask
+   ASSERT: mask updates smoothly; clicking "Invert" swaps subject <-> background selection
+4. Type prompt ("golden autumn bokeh background") with Mask active and press Enter
+   ASSERT: History shows "Region edit · Editing the region…" (2 credits)
+5. WAIT for completion
+   ASSERT: Editor navigates to branched photo; Compare ("Split wipe", "Side-by-side", "Hold \") reveals only masked area changed
+6. Press Cmd/Ctrl+Z (or click "← Parent") -> navigates back to parent branch; Cmd/Ctrl+Shift+Z returns to child

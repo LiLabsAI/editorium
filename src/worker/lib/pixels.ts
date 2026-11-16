@@ -2,19 +2,18 @@
  * Deterministic pixel operations behind one interface (phase 4).
  *
  * - `ImagesOps` — production: the Cloudflare Images binding. Resize, crop
- *   (`trim`), ESRGAN upscale (`upscale: "generate"`), BiRefNet background
- *   removal (`segment: "foreground"`) and masked compositing (`draw` with
- *   `composite: "in"`). Verified live against the binding (plans/phase4).
- * - `PngOps` — offline tests (AI_MOCK): the same operations in pure TS on
- *   PNGs, because the local Images emulator only supports resize/rotate.
+ *   (`trim`), pad (`border`), ESRGAN upscale (`upscale: "generate"`), BiRefNet
+ *   background removal (`segment: "foreground"`), and masked compositing
+ *   (`draw` with `composite: "in"`).
+ * - `PngOps` — offline tests (AI_MOCK): the same operations in pure TS on PNGs.
  *
- * Every op returns encoded bytes + mime so results flow straight into
- * storage and the fidelity guard.
+ * Every op preserves PNG alpha when the source uses PNG/WebP transparency so
+ * transparent cutouts never lose their alpha channel on later edits.
  */
 
 import { isMock } from "./providers";
 import { decodePng, encodeRgba, type Rgba } from "./png";
-import { imageDimensions } from "./r2";
+import { imageDimensions, sniffMime } from "./r2";
 
 export interface Encoded {
 	bytes: ArrayBuffer;
@@ -28,6 +27,14 @@ export interface PixelBox {
 	height: number;
 }
 
+export interface PadSpec {
+	top: number;
+	bottom: number;
+	left: number;
+	right: number;
+	color?: string;
+}
+
 export interface PixelOps {
 	/** Re-encode with EXIF rotation applied (all later coordinates are in
 	 * displayed space) and cap the longest side. */
@@ -35,12 +42,14 @@ export interface PixelOps {
 	dims(bytes: ArrayBuffer): Promise<{ width: number; height: number }>;
 	resize(bytes: ArrayBuffer, width: number, height: number): Promise<Encoded>;
 	crop(bytes: ArrayBuffer, box: PixelBox): Promise<Encoded>;
+	/** Expand the canvas with border padding (used for generative outpainting). */
+	pad(bytes: ArrayBuffer, pad: PadSpec): Promise<Encoded>;
 	/** Detail enhance: AI upscale (ESRGAN) when small, plus mild sharpening. */
 	enhance(bytes: ArrayBuffer): Promise<Encoded & { model: string }>;
 	/** Subject on transparency (PNG with alpha). */
 	removeBackground(bytes: ArrayBuffer): Promise<Encoded>;
 	/** Paste `patch` (resized to box) onto `base` at box, weighted by the
-	 * alpha of `maskPng` (same size as box). Outside the box: untouched. */
+	 * alpha of `maskPng` (resized to box). Outside the box: untouched. */
 	composite(base: ArrayBuffer, patch: ArrayBuffer, maskPng: ArrayBuffer, box: PixelBox): Promise<Encoded>;
 	/** Tiny RGBA thumbnail for the fidelity guard (aspect squeezed). */
 	thumbnail(bytes: ArrayBuffer, size: number): Promise<Rgba>;
@@ -53,6 +62,14 @@ export function pixelOps(env: Env): PixelOps {
 /** Largest AI-upscaled output (long side) and the size below which we upscale. */
 const UPSCALE_MAX_SIDE = 4096;
 const UPSCALE_BELOW_SIDE = 2048;
+
+/** Preserve PNG transparency on PNG/WebP inputs; encode JPEGs as quality 92. */
+function outputFormatFor(bytes: ArrayBuffer): { format: "image/png" | "image/jpeg"; quality?: number } {
+	const mime = sniffMime(bytes);
+	return mime === "image/png" || mime === "image/webp"
+		? { format: "image/png" }
+		: { format: "image/jpeg", quality: 92 };
+}
 
 /** The installed binding types predate AI upscaling (`upscale`, `fit:
  * "scale-up"`); both are live on the binding (probed 2026-09-25). */
@@ -73,6 +90,18 @@ export class ImagesOps implements PixelOps {
 	}
 
 	async dims(bytes: ArrayBuffer) {
+		const mime = sniffMime(bytes);
+		// JPEGs may carry EXIF orientation; images.info() returns displayed dims.
+		if (mime === "image/jpeg") {
+			try {
+				const info = await this.images.info(new Response(bytes).body!);
+				if ("width" in info && info.width > 0 && info.height > 0) {
+					return { width: info.width, height: info.height };
+				}
+			} catch {
+				// Fallback to header parse below.
+			}
+		}
 		const parsed = imageDimensions(bytes);
 		if (parsed) return parsed;
 		const info = await this.images.info(new Response(bytes).body!);
@@ -91,22 +120,38 @@ export class ImagesOps implements PixelOps {
 				fit: "scale-down",
 			});
 		}
-		const out = await handle.output({ format: "image/jpeg", quality: 92 });
-		return { bytes: await bytesOf(out), mime: "image/jpeg" };
+		const outOpts = outputFormatFor(bytes);
+		const out = await handle.output(outOpts);
+		return { bytes: await bytesOf(out), mime: outOpts.format };
 	}
 
 	async resize(bytes: ArrayBuffer, width: number, height: number): Promise<Encoded> {
-		const out = await this.input(bytes)
-			.transform({ width, height, fit: "squeeze" })
-			.output({ format: "image/jpeg", quality: 92 });
-		return { bytes: await bytesOf(out), mime: "image/jpeg" };
+		const outOpts = outputFormatFor(bytes);
+		const out = await this.input(bytes).transform({ width, height, fit: "squeeze" }).output(outOpts);
+		return { bytes: await bytesOf(out), mime: outOpts.format };
 	}
 
 	async crop(bytes: ArrayBuffer, box: PixelBox): Promise<Encoded> {
+		const outOpts = outputFormatFor(bytes);
 		const out = await this.input(bytes)
 			.transform({ trim: { left: box.left, top: box.top, width: box.width, height: box.height } })
-			.output({ format: "image/jpeg", quality: 95 });
-		return { bytes: await bytesOf(out), mime: "image/jpeg" };
+			.output(outOpts.format === "image/jpeg" ? { format: "image/jpeg", quality: 95 } : { format: "image/png" });
+		return { bytes: await bytesOf(out), mime: outOpts.format };
+	}
+
+	async pad(bytes: ArrayBuffer, pad: PadSpec): Promise<Encoded> {
+		const out = await this.input(bytes)
+			.transform({
+				border: {
+					top: pad.top,
+					bottom: pad.bottom,
+					left: pad.left,
+					right: pad.right,
+					color: pad.color ?? "#18181b",
+				},
+			})
+			.output({ format: "image/png" });
+		return { bytes: await bytesOf(out), mime: "image/png" };
 	}
 
 	async enhance(bytes: ArrayBuffer): Promise<Encoded & { model: string }> {
@@ -125,8 +170,9 @@ export class ImagesOps implements PixelOps {
 			handle = handle.transform(upscale as ImageTransform);
 			model = "images:esrgan+sharpen";
 		}
-		const out = await handle.transform({ sharpen: 1 }).output({ format: "image/jpeg", quality: 92 });
-		return { bytes: await bytesOf(out), mime: "image/jpeg", model };
+		const outOpts = outputFormatFor(bytes);
+		const out = await handle.transform({ sharpen: 1 }).output(outOpts);
+		return { bytes: await bytesOf(out), mime: outOpts.format, model };
 	}
 
 	async removeBackground(bytes: ArrayBuffer): Promise<Encoded> {
@@ -135,19 +181,27 @@ export class ImagesOps implements PixelOps {
 	}
 
 	async composite(base: ArrayBuffer, patch: ArrayBuffer, maskPng: ArrayBuffer, box: PixelBox): Promise<Encoded> {
-		const fitted = await bytesOf(
-			await this.input(patch)
-				.transform({ width: box.width, height: box.height, fit: "squeeze" })
-				.output({ format: "image/png" }),
-		);
+		const [fitted, sizedMask] = await Promise.all([
+			bytesOf(
+				await this.input(patch)
+					.transform({ width: box.width, height: box.height, fit: "squeeze" })
+					.output({ format: "image/png" }),
+			),
+			bytesOf(
+				await this.input(maskPng)
+					.transform({ width: box.width, height: box.height, fit: "squeeze" })
+					.output({ format: "image/png" }),
+			),
+		]);
 		// "in": the patch shows only where the mask is opaque (feathered alpha).
 		const masked = await bytesOf(
-			await this.input(maskPng).draw(new Response(fitted).body!, { composite: "in" }).output({ format: "image/png" }),
+			await this.input(sizedMask).draw(new Response(fitted).body!, { composite: "in" }).output({ format: "image/png" }),
 		);
+		const outOpts = outputFormatFor(base);
 		const out = await this.input(base)
 			.draw(new Response(masked).body!, { left: box.left, top: box.top })
-			.output({ format: "image/jpeg", quality: 92 });
-		return { bytes: await bytesOf(out), mime: "image/jpeg" };
+			.output(outOpts);
+		return { bytes: await bytesOf(out), mime: outOpts.format };
 	}
 
 	async thumbnail(bytes: ArrayBuffer, size: number): Promise<Rgba> {
@@ -197,12 +251,35 @@ export class PngOps implements PixelOps {
 
 	async crop(bytes: ArrayBuffer, box: PixelBox): Promise<Encoded> {
 		const src = await decodePng(bytes);
-		const data = new Uint8Array(box.width * box.height * 4);
-		for (let y = 0; y < box.height; y++) {
-			const from = ((box.top + y) * src.width + box.left) * 4;
-			data.set(src.data.subarray(from, from + box.width * 4), y * box.width * 4);
+		const left = Math.max(0, Math.min(src.width - 1, box.left));
+		const top = Math.max(0, Math.min(src.height - 1, box.top));
+		const width = Math.max(1, Math.min(src.width - left, box.width));
+		const height = Math.max(1, Math.min(src.height - top, box.height));
+		const data = new Uint8Array(width * height * 4);
+		for (let y = 0; y < height; y++) {
+			const from = ((top + y) * src.width + left) * 4;
+			data.set(src.data.subarray(from, from + width * 4), y * width * 4);
 		}
-		return png({ width: box.width, height: box.height, data });
+		return png({ width, height, data });
+	}
+
+	async pad(bytes: ArrayBuffer, pad: PadSpec): Promise<Encoded> {
+		const src = await decodePng(bytes);
+		const width = src.width + pad.left + pad.right;
+		const height = src.height + pad.top + pad.bottom;
+		const data = new Uint8Array(width * height * 4);
+		for (let i = 0; i < data.length; i += 4) {
+			data[i] = 24;
+			data[i + 1] = 24;
+			data[i + 2] = 27;
+			data[i + 3] = 255;
+		}
+		for (let y = 0; y < src.height; y++) {
+			const dstStart = ((y + pad.top) * width + pad.left) * 4;
+			const srcStart = y * src.width * 4;
+			data.set(src.data.subarray(srcStart, srcStart + src.width * 4), dstStart);
+		}
+		return png({ width, height, data });
 	}
 
 	async enhance(bytes: ArrayBuffer): Promise<Encoded & { model: string }> {
@@ -226,15 +303,26 @@ export class PngOps implements PixelOps {
 	async composite(base: ArrayBuffer, patch: ArrayBuffer, maskPng: ArrayBuffer, box: PixelBox): Promise<Encoded> {
 		const dst = await decodePng(base);
 		const src = sample(await decodePng(patch), box.width, box.height);
-		const mask = await decodePng(maskPng);
+		const mask = sample(await decodePng(maskPng), box.width, box.height);
 		const out = new Uint8Array(dst.data);
 		for (let y = 0; y < box.height; y++) {
+			const dy = box.top + y;
+			if (dy < 0 || dy >= dst.height) continue;
 			for (let x = 0; x < box.width; x++) {
-				const a = mask.data[(y * mask.width + x) * 4 + 3]! / 255;
-				if (a === 0) continue;
-				const d = ((box.top + y) * dst.width + box.left + x) * 4;
+				const dx = box.left + x;
+				if (dx < 0 || dx >= dst.width) continue;
 				const s = (y * box.width + x) * 4;
-				for (let c = 0; c < 3; c++) out[d + c] = Math.round(out[d + c]! * (1 - a) + src.data[s + c]! * a);
+				const a = (mask.data[s + 3]! / 255) * (src.data[s + 3]! / 255);
+				if (a === 0) continue;
+				const d = (dy * dst.width + dx) * 4;
+				const da = out[d + 3]! / 255;
+				const outA = a + da * (1 - a);
+				if (outA > 0) {
+					for (let c = 0; c < 3; c++) {
+						out[d + c] = Math.round((src.data[s + c]! * a + out[d + c]! * da * (1 - a)) / outA);
+					}
+				}
+				out[d + 3] = Math.round(outA * 255);
 			}
 		}
 		return png({ width: dst.width, height: dst.height, data: out });

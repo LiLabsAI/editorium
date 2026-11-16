@@ -1,12 +1,12 @@
-# E2E: enhance via chat (album + editor surfaces)
+# E2E: enhance and style-transfer via chat & composer
 
 1. Open /albums/:albumId
-2. In the Ask composer type: "make this high quality 4k like a costly camera"
-   ATTACH an image via the @ mention picker
-3. SEND
-   ASSERT: user bubble appears; assistant narration streams (no [job:...] tokens)
-   ASSERT: inline status chip shows the enhance job running
-4. WAIT for done
-   ASSERT: result thumbnail in chat; adjacent canvas card gains the enhanced image
-5. Open the enhanced image in the editor
-   ASSERT: version dropdown lists "High-quality 4K enhance" as current
+2. Click "💬" (Attach to chat) on a photo card
+   ASSERT: thumbnail attachment pill appears inside the Ask composer (NO job or credits billed yet)
+3. Type: "make this high quality 4k like a costly camera" and press Enter
+   ASSERT: user bubble displays attached photo + prompt; narration streams cleanly
+   ASSERT: WebSocket / status indicator shows Enhance running (3 credits)
+4. WAIT for job completion
+   ASSERT: result thumbnail appears in chat and on the album canvas
+5. Open the enhanced photo in the editor (/albums/:albumId/images/:imageId)
+   ASSERT: TopBar reflects updated credit balance, BranchRail shows Parent -> Enhanced branch, and History shows "Enhance · Same photo, more detail · 3 credits"

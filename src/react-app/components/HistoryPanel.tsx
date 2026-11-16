@@ -8,6 +8,7 @@ import {
 	isPending,
 	matchesFilter,
 	PENDING_LABEL,
+	pluralize,
 	regionWords,
 	type HistoryFilter,
 } from "../lib/history";
@@ -56,11 +57,12 @@ export function HistoryPanel({
 
 	return (
 		<div className="flex min-h-0 flex-1 flex-col">
-			<div className="flex items-center justify-between px-4 pb-2 pt-4">
+			<div className="flex items-center justify-between px-4 pb-2 pt-3">
 				<h2 className="text-sm font-semibold">History</h2>
 				<div className="flex gap-1" role="group" aria-label="Filter history">
 					{(["all", "edits", "chat"] as const).map((f) => (
 						<button
+							type="button"
 							key={f}
 							aria-pressed={filter === f}
 							onClick={() => setFilter(f)}
@@ -119,13 +121,13 @@ function Tips() {
 			<p className="mb-2 text-sm text-foreground">Every result is a new photo beside the original.</p>
 			<ul className="space-y-1.5">
 				<li>
-					<span className="text-foreground">Drag a box</span> on the photo, then describe the change — everything outside it stays pixel-for-pixel.
+					<span className="text-foreground">Select with Box, Brush, Lasso, or Magic Wand</span>, then describe the change — everything outside stays untouched.
 				</li>
 				<li>
-					<span className="text-foreground">Enhance</span> and <span className="text-foreground">Remove background</span> keep the photo as it is.
+					<span className="text-foreground">Adjust & Transform</span> runs live in WebGL2 with zero AI credits.
 				</li>
 				<li>
-					<span className="text-foreground">Type without a box</span> to reimagine the whole photo, or ask a question about it.
+					<span className="text-foreground">Queue chips</span> to combine up to 5 local edits into a single generation pass.
 				</li>
 			</ul>
 		</div>
@@ -197,9 +199,10 @@ function TurnView({
 			) : reply.status === "error" ? (
 				<div className="rounded-xl border border-red-400/40 px-3 py-2 text-xs">
 					<p className="text-sm text-red-300">{reply.error}</p>
-					{reply.refunded && <p className="mt-0.5 text-muted-foreground">{reply.credits} credits refunded</p>}
+					{reply.refunded && <p className="mt-0.5 text-muted-foreground">{pluralize(reply.credits, "credit")} refunded</p>}
 					<Actions>
 						{canRetry(turn) && <Action onClick={() => onRetry(turn)}>Retry</Action>}
+						{cls === "reimagine" && <Action onClick={() => onRegionize(request.text)}>Redo on a region</Action>}
 						<Action onClick={() => onEditPrompt(request.text)}>Edit prompt</Action>
 					</Actions>
 				</div>
@@ -211,14 +214,16 @@ function TurnView({
 					meta={[
 						cls ? CLASS_PROMISE[cls] : null,
 						reply.result.fidelity !== null ? `fidelity ${reply.result.fidelity.toFixed(2)}` : null,
-						reply.credits ? `${reply.credits} credits` : null,
+						reply.credits ? pluralize(reply.credits, "credit") : null,
 					]
 						.filter(Boolean)
 						.join(" · ")}
 					onOpen={onOpen}
 				>
 					{canRetry(turn) && <Action onClick={() => onRetry(turn)}>Retry</Action>}
-					{cls === "reimagine" && <Action onClick={() => onRegionize(request.text)}>Redo on a region</Action>}
+					{(cls === "reimagine" || cls === "style_transfer") && (
+						<Action onClick={() => onRegionize(request.text)}>Redo on a region</Action>
+					)}
 					{!turn.derived && cls !== "adjust" && <Action onClick={() => onEditPrompt(request.text)}>Edit prompt</Action>}
 				</ResultRow>
 			) : (
@@ -246,7 +251,12 @@ function ResultRow({
 	return (
 		<div className={`flex gap-3 rounded-xl border px-2.5 py-2 ${current ? "border-[rgba(99,120,255,0.7)]" : "ed-hairline"}`}>
 			{imageId ? (
-				<button onClick={() => onOpen(imageId)} className="shrink-0 overflow-hidden rounded-lg" aria-label={`Open ${title}`}>
+				<button
+					type="button"
+					onClick={() => onOpen(imageId)}
+					className="shrink-0 overflow-hidden rounded-lg"
+					aria-label={`Open ${title}`}
+				>
 					<img src={fileUrl(imageId, "thumb")} alt="" loading="lazy" className="size-12 object-cover" />
 				</button>
 			) : (
@@ -270,7 +280,7 @@ function Actions({ children }: { children: React.ReactNode }) {
 
 function Action({ onClick, children }: { onClick: () => void; children: React.ReactNode }) {
 	return (
-		<button onClick={onClick} className="text-xs text-[rgb(140,155,255)] hover:underline">
+		<button type="button" onClick={onClick} className="text-xs text-[rgb(140,155,255)] hover:underline">
 			{children}
 		</button>
 	);

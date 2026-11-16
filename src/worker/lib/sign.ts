@@ -22,7 +22,7 @@ export async function verifyPublicImageUrl(
 	const lastDot = token.lastIndexOf(".");
 	if (lastDot < 0) return null;
 	const payload = token.slice(0, lastDot);
-	if (!safeEqual(await mac("img", payload, env.AUTH_SECRET), token.slice(lastDot + 1))) {
+	if (!(await safeEqual(await mac("img", payload, env.AUTH_SECRET), token.slice(lastDot + 1)))) {
 		return null;
 	}
 	const dot = payload.indexOf(".");

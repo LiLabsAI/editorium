@@ -1,103 +1,142 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router";
 
-import { api, describeError, fileUrl, uploadFile, waitForJob } from "../lib/api";
-import type { ImageDto, MessageDto, ThreadDto } from "../lib/api";
-import { AskComposer } from "../components/Composer";
-import { TopBar, PillButton, IconButton } from "../components/TopBar";
+import {
+	api,
+	describeError,
+	fileUrl,
+	readAgentStream,
+	uploadFile,
+	waitForJob,
+	type ImageDto,
+	type Me,
+	type MessageDto,
+	type ReferenceDto,
+	type ThreadDto,
+} from "../lib/api";
+import { jobEvents } from "../lib/events";
+import { AskComposer, type AttachedTarget } from "../components/Composer";
+import { IconButton, PillButton, TopBar } from "../components/TopBar";
 
-type Frame = { event: string; data: Record<string, unknown> };
-
-function parseFrame(part: string): Frame | null {
-	const line = part.trim();
-	if (!line.startsWith("data:")) return null;
-	try {
-		return JSON.parse(line.slice(5).trim()) as Frame;
-	} catch {
-		return null;
-	}
-}
-
-/** Album workspace (Screen B): image cards on a dark canvas + the Ask chat panel. */
-export function AlbumPage({ projectName }: { projectName: string }) {
+/** Album workspace (Screen B): image gallery with drag-drop uploads, branch filter,
+ * non-destructive chat attachment, real-time DO status updates, and Ask chat panel. */
+export function AlbumPage({ projectName, me }: { projectName: string; me?: Me | null }) {
 	const { albumId } = useParams<{ albumId: string }>();
 	const navigate = useNavigate();
 	const [albumTitle, setAlbumTitle] = useState("Album");
+	const [filter, setFilter] = useState<"all" | "uploads" | "generated">("all");
+	const [hideBranches, setHideBranches] = useState(false);
 	const [images, setImages] = useState<ImageDto[]>([]);
 	const [threads, setThreads] = useState<ThreadDto[]>([]);
 	const [threadId, setThreadId] = useState<string | null>(null);
 	const [messages, setMessages] = useState<MessageDto[]>([]);
 	const [streaming, setStreaming] = useState("");
+	const [isStreaming, setIsStreaming] = useState(false);
 	const [uploading, setUploading] = useState(false);
+	const [draggingOver, setDraggingOver] = useState(false);
+	const [attached, setAttached] = useState<AttachedTarget | null>(null);
+	const [references, setReferences] = useState<ReferenceDto[]>([]);
+	const [selectedRefIds, setSelectedRefIds] = useState<string[]>([]);
 	const [notice, setNotice] = useState<string | null>(null);
 	const [pendingJobs, setPendingJobs] = useState(0);
 	const fileRef = useRef<HTMLInputElement>(null);
+	const abortRef = useRef<AbortController | null>(null);
 
-	const loadImages = useCallback(async () => {
-		if (!albumId) return;
-		const [imgsRes, threadsRes] = await Promise.all([
-			api.albumImages(albumId),
-			api.albumThreads(albumId),
-		]);
-		setImages(imgsRes.images);
-		setThreads(threadsRes.threads);
-		// Default to an album chat; photo histories are listed but belong to the editor.
-		const albumChat = threadsRes.threads.find((t) => !t.rootImageId);
-		if (albumChat && !threadId) {
-			setThreadId(albumChat.id);
-		} else if (!albumChat) {
-			const { thread } = await api.createThread(albumId);
-			setThreads([thread, ...threadsRes.threads]);
-			setThreadId(thread.id);
-		}
-	}, [albumId, threadId]);
-
-	const hasPending = images.some((img) => img.segmentStatus === "pending");
-	const activeThread = threads.find((t) => t.id === threadId);
+	const loadImages = useCallback(
+		async (activeFilter = filter, preferThreadId?: string | null) => {
+			if (!albumId) return;
+			const [imgsRes, threadsRes] = await Promise.all([
+				api.albumImages(albumId, activeFilter),
+				api.albumThreads(albumId),
+			]);
+			setImages(imgsRes.images);
+			setThreads(threadsRes.threads);
+			const currentId = preferThreadId !== undefined ? preferThreadId : threadId;
+			if (!currentId || !threadsRes.threads.some((t) => t.id === currentId)) {
+				const albumChat = threadsRes.threads.find((t) => !t.rootImageId);
+				if (albumChat) {
+					setThreadId(albumChat.id);
+				} else {
+					const { thread } = await api.createThread(albumId);
+					setThreads([thread, ...threadsRes.threads]);
+					setThreadId(thread.id);
+				}
+			}
+		},
+		[albumId, filter, threadId],
+	);
 
 	useEffect(() => {
-		loadImages();
-		if (albumId) api.albumGet(albumId).then((r) => setAlbumTitle(r.album.title));
+		setThreadId(null);
+		setMessages([]);
+		setAttached(null);
+		setSelectedRefIds([]);
+		setStreaming("");
+		setNotice(null);
+		if (!albumId) return;
+		void loadImages(filter, null).catch((err) => setNotice(describeError(err)));
+		api.albumGet(albumId)
+			.then((r) => setAlbumTitle(r.album.title))
+			.catch((err) => setNotice(describeError(err)));
+		api.references()
+			.then((r) => setReferences(r.references))
+			.catch(() => {});
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [albumId]);
 
-	// While any card is being recognized, refresh until it settles (plan 21).
+	const hasPendingSegments = images.some((img) => img.segmentStatus === "pending");
+	const activeThread = threads.find((t) => t.id === threadId);
+
+	// Real-time DO event subscription replaces rapid polling; fallback interval only runs when WS isn't open.
 	useEffect(() => {
-		if (!hasPending) return;
-		const timer = window.setInterval(loadImages, 2500);
-		return () => window.clearInterval(timer);
-	}, [hasPending, loadImages]);
+		const unsub = jobEvents.subscribe((ev) => {
+			if (ev.status === "done" || ev.status === "error" || ev.segmentStatus) {
+				void loadImages(filter).catch(() => {});
+			}
+		});
+		const timer =
+			hasPendingSegments && !jobEvents.isConnected()
+				? window.setInterval(() => void loadImages(filter).catch(() => {}), 3000)
+				: null;
+		return () => {
+			unsub();
+			if (timer) window.clearInterval(timer);
+		};
+	}, [hasPendingSegments, filter, loadImages]);
 
 	useEffect(() => {
 		if (!threadId) return;
-		api.threadMessages(threadId).then((res) => setMessages(res.messages));
+		api.threadMessages(threadId)
+			.then((res) => setMessages(res.messages))
+			.catch((err) => setNotice(describeError(err)));
 	}, [threadId]);
 
 	async function onUpload(files: FileList | null) {
 		if (!albumId || !files?.length) return;
+		const valid = Array.from(files).filter((f) => f.size > 0);
+		if (!valid.length) return;
 		setUploading(true);
 		setNotice(null);
 		try {
-			for (const file of Array.from(files)) {
+			for (const file of valid) {
 				await uploadFile(albumId, file);
 			}
 		} catch (err) {
 			setNotice(`Upload failed: ${describeError(err)}`);
 		} finally {
-			await loadImages().catch(() => undefined);
+			await loadImages(filter).catch(() => undefined);
 			setUploading(false);
 		}
 	}
 
-	/** Follow a queued AI job to completion, then refresh the grid + chat. */
 	async function followJob(jobId: string) {
 		if (!threadId) return;
 		setPendingJobs((n) => n + 1);
 		try {
 			const job = await waitForJob(jobId);
 			if (!job) setNotice("That's taking longer than usual — it will appear here when it finishes.");
-			else if (job.status === "error") setNotice("The AI operation failed. Your credits were refunded.");
-			await loadImages();
+			else if (job.status === "error") setNotice(job.error ?? "The AI operation failed. Your credits were refunded.");
+			await loadImages(filter);
 			const { messages: fresh } = await api.threadMessages(threadId);
 			setMessages(fresh);
 		} catch (err) {
@@ -107,64 +146,77 @@ export function AlbumPage({ projectName }: { projectName: string }) {
 		}
 	}
 
-	async function send(text: string, attachedImageId?: string, paletteIds?: string[]) {
-		if (!threadId) return;
+	async function send(text: string) {
+		if (!threadId || isStreaming) return;
+		const controller = new AbortController();
+		abortRef.current = controller;
 		setStreaming("");
+		setIsStreaming(true);
 		const optimistic: MessageDto = {
 			id: `tmp-${Date.now()}`,
 			threadId,
 			role: "user",
 			text,
-			attachedImageId: attachedImageId ?? null,
+			attachedImageId: attached?.id ?? null,
 			resultImageId: null,
 			operation: null,
 			jobId: null,
 			createdAt: new Date().toISOString(),
 		};
 		setMessages((m) => [...m, optimistic]);
-
 		setNotice(null);
+		const targetAttachmentId = attached?.id;
+		const refs = [...selectedRefIds];
+		setAttached(null);
+
 		const jobIds: string[] = [];
 		try {
-			const res = await api.sendMessage(threadId, { text, attachedImageId, paletteIds });
-			if (!res.ok || !res.body) {
-				const detail = (await res.json().catch(() => ({}))) as { error?: string };
-				setNotice(describeError(new Error(detail.error ?? "error")));
-				return;
-			}
-			const reader = res.body.getReader();
-			const decoder = new TextDecoder();
-			let buffer = "";
-			for (;;) {
-				const { done, value } = await reader.read();
-				if (done) break;
-				buffer += decoder.decode(value, { stream: true });
-				const parts = buffer.split("\n\n");
-				buffer = parts.pop() ?? "";
-				for (const frame of parts.map(parseFrame)) {
-					if (!frame) continue;
-					if (frame.event === "token") {
-						setStreaming((s) => s + String(frame.data.value ?? ""));
-					} else if (frame.event === "tool" && typeof frame.data.jobId === "string") {
-						jobIds.push(frame.data.jobId);
-					} else if (frame.event === "error") {
-						setNotice(
-							frame.data.code === "insufficient_credits"
-								? describeError(new Error("insufficient_credits"))
-								: String(frame.data.message ?? "Something went wrong."),
-						);
-					}
+			const res = await api.sendMessage(
+				threadId,
+				{
+					text,
+					attachedImageId: targetAttachmentId,
+					mentionImageIds: refs.length ? refs : undefined,
+				},
+				controller.signal,
+			);
+			await readAgentStream(res, (event, data) => {
+				if (event === "token") {
+					setStreaming((s) => s + String(data.value ?? ""));
+				} else if (event === "tool" && typeof data.jobId === "string") {
+					jobIds.push(data.jobId);
+				} else if (event === "error") {
+					setNotice(
+						data.code === "insufficient_credits"
+							? describeError(new Error("insufficient_credits"))
+							: String(data.message ?? "Something went wrong."),
+					);
 				}
-			}
+			});
 		} catch (err) {
-			setNotice(describeError(err));
+			if (!(err instanceof DOMException && err.name === "AbortError")) {
+				setNotice(describeError(err));
+			}
 		} finally {
-			// Refresh the persisted conversation, then follow any queued jobs.
+			abortRef.current = null;
+			setIsStreaming(false);
+			setStreaming("");
 			const { messages: fresh } = await api.threadMessages(threadId).catch(() => ({ messages }));
 			setMessages(fresh);
-			setStreaming("");
 		}
 		for (const jobId of jobIds) void followJob(jobId);
+	}
+
+	async function startNewThread() {
+		if (!albumId) return;
+		try {
+			const { thread } = await api.createThread(albumId, true);
+			setThreads((list) => [thread, ...list]);
+			setThreadId(thread.id);
+			setMessages([]);
+		} catch (err) {
+			setNotice(describeError(err));
+		}
 	}
 
 	async function deleteImage(image: ImageDto) {
@@ -177,37 +229,53 @@ export function AlbumPage({ projectName }: { projectName: string }) {
 	}
 
 	async function toggleBookmark(image: ImageDto) {
-		await api.patchImage(image.id, { bookmarked: !image.bookmarkedAt });
-		setImages((imgs) =>
-			imgs.map((i) =>
-				i.id === image.id
-					? { ...i, bookmarkedAt: i.bookmarkedAt ? null : new Date().toISOString() }
-					: i,
-			),
-		);
+		try {
+			await api.patchImage(image.id, { bookmarked: !image.bookmarkedAt });
+			setImages((imgs) =>
+				imgs.map((i) =>
+					i.id === image.id ? { ...i, bookmarkedAt: i.bookmarkedAt ? null : new Date().toISOString() } : i,
+				),
+			);
+		} catch (err) {
+			setNotice(describeError(err));
+		}
 	}
+
+	const visibleImages = hideBranches ? images.filter((i) => !i.sourceImageId) : images;
 
 	return (
 		<div className="flex h-screen flex-col">
 			<TopBar
 				projectName={projectName}
 				crumbs={[{ label: albumTitle }]}
+				me={me}
 				actions={
 					<>
+						<button
+							type="button"
+							onClick={() => setHideBranches((v) => !v)}
+							aria-pressed={hideBranches}
+							className={`rounded-lg px-2 py-1 text-xs transition ${
+								hideBranches ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted"
+							}`}
+						>
+							{hideBranches ? "Showing roots" : "All versions"}
+						</button>
 						<select
 							aria-label="Filter images"
-							className="rounded-lg bg-transparent px-2 py-1 text-sm text-muted-foreground hover:bg-muted"
-							onChange={async (e) => {
-								if (!albumId) return;
-								const res = await api.albumImages(albumId, e.target.value);
-								setImages(res.images);
+							value={filter}
+							onChange={(e) => {
+								const next = e.target.value as "all" | "uploads" | "generated";
+								setFilter(next);
+								void loadImages(next).catch((err) => setNotice(describeError(err)));
 							}}
+							className="rounded-lg bg-transparent px-2 py-1 text-sm text-muted-foreground hover:bg-muted"
 						>
 							<option value="all">All</option>
 							<option value="uploads">Uploads</option>
 							<option value="generated">Generated</option>
 						</select>
-						<PillButton onClick={() => fileRef.current?.click()}>
+						<PillButton onClick={() => fileRef.current?.click()} disabled={uploading}>
 							{uploading ? "Uploading…" : "Upload"}
 						</PillButton>
 						<input
@@ -216,32 +284,56 @@ export function AlbumPage({ projectName }: { projectName: string }) {
 							accept="image/png,image/jpeg,image/webp,image/gif"
 							multiple
 							hidden
-							onChange={(e) => onUpload(e.target.files)}
+							onChange={(e) => {
+								void onUpload(e.target.files);
+								e.target.value = "";
+							}}
 						/>
 					</>
 				}
 			/>
 			<div className="flex min-h-0 flex-1">
-				{/* Album canvas */}
-				<main className="ed-canvas-bg min-w-0 flex-1 overflow-y-auto p-8">
-					{images.length === 0 ? (
+				{/* Album canvas with drag-and-drop */}
+				<main
+					onDragOver={(e) => {
+						e.preventDefault();
+						setDraggingOver(true);
+					}}
+					onDragLeave={() => setDraggingOver(false)}
+					onDrop={(e) => {
+						e.preventDefault();
+						setDraggingOver(false);
+						void onUpload(e.dataTransfer.files);
+					}}
+					className={`ed-canvas-bg relative min-w-0 flex-1 overflow-y-auto p-8 transition ${
+						draggingOver ? "ring-2 ring-inset ring-indigo-400" : ""
+					}`}
+				>
+					{visibleImages.length === 0 ? (
 						<button
+							type="button"
 							onClick={() => fileRef.current?.click()}
 							className="mx-auto mt-20 flex h-56 w-72 flex-col items-center justify-center gap-2 rounded-2xl border border-dashed border-white/15 text-sm text-muted-foreground hover:border-white/30"
 						>
 							<span className="text-2xl">+</span>
-							Upload a photo to start
+							Drop or upload a photo to start
 						</button>
 					) : (
 						<div className="flex flex-wrap items-start gap-6">
-							{images.map((image) => (
+							{visibleImages.map((image) => (
 								<ImageCard
 									key={image.id}
 									image={image}
 									onOpen={() => navigate(`/albums/${albumId}/images/${image.id}`)}
-									onBookmark={() => toggleBookmark(image)}
-									onDelete={() => deleteImage(image)}
-									onAttach={() => send(`Work with ${image.filenameLabel}`, image.id)}
+									onBookmark={() => void toggleBookmark(image)}
+									onDelete={() => void deleteImage(image)}
+									onAttach={() =>
+										setAttached({
+											id: image.id,
+											label: image.filenameLabel,
+											thumbUrl: fileUrl(image.id, "thumb"),
+										})
+									}
 								/>
 							))}
 						</div>
@@ -250,35 +342,46 @@ export function AlbumPage({ projectName }: { projectName: string }) {
 
 				{/* Chat panel */}
 				<aside className="ed-panel flex w-[430px] shrink-0 flex-col border-l ed-hairline">
-					<div className="flex items-center justify-between px-4 py-3">
+					<div className="flex items-center justify-between gap-2 px-4 py-3">
 						<h2 className="text-lg font-semibold">Create</h2>
-						<select
-							aria-label="Chat thread"
-							value={threadId ?? ""}
-							onChange={(e) => setThreadId(e.target.value)}
-							className="rounded-full bg-secondary px-3 py-1 text-sm"
-						>
-							<optgroup label="Album chats">
-								{threads
-									.filter((t) => !t.rootImageId)
-									.map((t) => (
-										<option key={t.id} value={t.id}>
-											{t.title}
-										</option>
-									))}
-							</optgroup>
-							{threads.some((t) => t.rootImageId) && (
-								<optgroup label="Photo histories">
+						<div className="flex items-center gap-1.5">
+							<select
+								aria-label="Chat thread"
+								value={threadId ?? ""}
+								onChange={(e) => setThreadId(e.target.value)}
+								className="max-w-44 truncate rounded-full bg-secondary px-3 py-1 text-sm"
+							>
+								<optgroup label="Album chats">
 									{threads
-										.filter((t) => t.rootImageId)
+										.filter((t) => !t.rootImageId)
 										.map((t) => (
 											<option key={t.id} value={t.id}>
-												{images.find((i) => i.id === t.rootImageId)?.filenameLabel ?? "Photo history"}
+												{t.title}
 											</option>
 										))}
 								</optgroup>
-							)}
-						</select>
+								{threads.some((t) => t.rootImageId) && (
+									<optgroup label="Photo histories">
+										{threads
+											.filter((t) => t.rootImageId)
+											.map((t) => (
+												<option key={t.id} value={t.id}>
+													{images.find((i) => i.id === t.rootImageId)?.filenameLabel ?? "Photo history"}
+												</option>
+											))}
+									</optgroup>
+								)}
+							</select>
+							<button
+								type="button"
+								title="New chat thread"
+								aria-label="New chat thread"
+								onClick={() => void startNewThread()}
+								className="rounded-full border ed-hairline px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+							>
+								+ New
+							</button>
+						</div>
 					</div>
 					<div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 pb-4" role="log" aria-live="polite">
 						{messages.map((m) => (
@@ -288,9 +391,7 @@ export function AlbumPage({ projectName }: { projectName: string }) {
 								onOpen={(id) => navigate(`/albums/${albumId}/images/${id}`)}
 							/>
 						))}
-						{streaming && (
-							<p className="whitespace-pre-wrap text-[15px] text-foreground/90">{streaming}</p>
-						)}
+						{streaming && <p className="whitespace-pre-wrap text-[15px] text-foreground/90">{streaming}</p>}
 						{pendingJobs > 0 && (
 							<p role="status" className="flex items-center gap-2 text-sm text-muted-foreground">
 								<span className="inline-block size-3 animate-spin rounded-full border-2 border-white/20 border-t-white/80" />
@@ -306,13 +407,32 @@ export function AlbumPage({ projectName }: { projectName: string }) {
 					<div className="p-4 pt-0">
 						{activeThread?.rootImageId ? (
 							<button
+								type="button"
 								onClick={() => navigate(`/albums/${albumId}/images/${activeThread.rootImageId}`)}
 								className="w-full rounded-2xl border ed-hairline bg-card px-4 py-3 text-sm transition hover:bg-muted"
 							>
 								Continue this photo's history in the editor →
 							</button>
 						) : (
-							<AskComposer onSend={(text) => send(text)} />
+							<AskComposer
+								onSend={(text) => void send(text)}
+								onAbort={() => abortRef.current?.abort()}
+								disabled={isStreaming}
+								streaming={isStreaming}
+								attachment={attached}
+								onClearAttachment={() => setAttached(null)}
+								references={references}
+								selectedRefIds={selectedRefIds}
+								onToggleRef={(id) =>
+									setSelectedRefIds((list) =>
+										list.includes(id)
+											? list.filter((x) => x !== id)
+											: list.length >= 3
+												? list
+												: [...list, id],
+									)
+								}
+							/>
 						)}
 					</div>
 				</aside>
@@ -334,9 +454,16 @@ function ImageCard({
 	onDelete: () => void;
 	onAttach: () => void;
 }) {
+	const [confirmingDelete, setConfirmingDelete] = useState(false);
+
 	return (
 		<figure className="group relative w-72 select-none">
-			<button onClick={onOpen} className="block w-full overflow-hidden rounded-xl bg-secondary" aria-label={`Open ${image.filenameLabel}`}>
+			<button
+				type="button"
+				onClick={onOpen}
+				className="block w-full overflow-hidden rounded-xl bg-secondary focus-visible:ring-2"
+				aria-label={`Open ${image.filenameLabel}`}
+			>
 				<img
 					src={fileUrl(image.id, "web")}
 					alt={image.filenameLabel}
@@ -346,7 +473,7 @@ function ImageCard({
 			</button>
 			{image.segmentStatus === "pending" && (
 				<div
-					className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/45 text-xs text-white"
+					className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-xl bg-black/45 text-xs text-white"
 					role="status"
 				>
 					<span className="mr-2 inline-block size-3 animate-spin rounded-full border-2 border-white/30 border-t-white" />
@@ -366,18 +493,31 @@ function ImageCard({
 					{image.kind}
 				</span>
 			)}
-			<div className="absolute bottom-2 right-2 opacity-0 transition group-hover:opacity-100">
-				<IconButton title="Bookmark" onClick={onBookmark}>
+			<div className="absolute bottom-2 right-2 opacity-0 transition group-hover:opacity-100 group-focus-within:opacity-100">
+				<IconButton title={image.bookmarkedAt ? "Remove bookmark" : "Bookmark"} active={!!image.bookmarkedAt} onClick={onBookmark}>
 					{image.bookmarkedAt ? "★" : "☆"}
 				</IconButton>
 			</div>
-			<div className="absolute bottom-2 left-2 flex gap-1 opacity-0 transition group-hover:opacity-100">
-				<IconButton title="Delete" onClick={onDelete}>
-					🗑
-				</IconButton>
-				<IconButton title="Attach to chat" onClick={onAttach}>
-					💬
-				</IconButton>
+			<div className="absolute bottom-2 left-2 flex items-center gap-1 opacity-0 transition group-hover:opacity-100 group-focus-within:opacity-100">
+				{confirmingDelete ? (
+					<div className="flex items-center gap-1 rounded-lg bg-black/80 px-2 py-1 text-xs">
+						<button type="button" onClick={onDelete} className="font-medium text-red-300 hover:text-red-200">
+							Confirm
+						</button>
+						<button type="button" onClick={() => setConfirmingDelete(false)} className="text-white/70 hover:text-white">
+							Cancel
+						</button>
+					</div>
+				) : (
+					<>
+						<IconButton title="Delete" onClick={() => setConfirmingDelete(true)}>
+							🗑
+						</IconButton>
+						<IconButton title="Attach to chat" onClick={onAttach}>
+							💬
+						</IconButton>
+					</>
+				)}
 			</div>
 		</figure>
 	);
@@ -386,7 +526,16 @@ function ImageCard({
 function MessageBubble({ message, onOpen }: { message: MessageDto; onOpen: (imageId: string) => void }) {
 	if (message.role === "user") {
 		return (
-			<div className="ml-8 rounded-2xl bg-secondary px-4 py-3 text-[15px]">{message.text}</div>
+			<div className="ml-8 space-y-1.5 rounded-2xl bg-secondary px-4 py-3 text-[15px]">
+				{message.attachedImageId && (
+					<img
+						src={fileUrl(message.attachedImageId, "thumb")}
+						alt="Attached photo"
+						className="h-14 w-14 rounded-lg object-cover"
+					/>
+				)}
+				<p>{message.text}</p>
+			</div>
 		);
 	}
 	return (
@@ -394,6 +543,7 @@ function MessageBubble({ message, onOpen }: { message: MessageDto; onOpen: (imag
 			<p className="whitespace-pre-wrap text-[15px] leading-relaxed">{message.text}</p>
 			{message.resultImageId && (
 				<button
+					type="button"
 					onClick={() => onOpen(message.resultImageId!)}
 					className="block overflow-hidden rounded-xl border ed-hairline"
 					aria-label="Open result in editor"

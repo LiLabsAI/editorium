@@ -1,10 +1,14 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { AdjustPanel } from "./components/AdjustPanel";
+import { BranchRail } from "./components/BranchRail";
 import { EditComposer } from "./components/EditComposer";
 import { HistoryPanel } from "./components/HistoryPanel";
-import type { HistoryTurn } from "./lib/api";
-import { composerMode, regionWords, singleTarget } from "./lib/history";
+import { ShareDialog } from "./components/ShareDialog";
+import { computeEdgeAwareWand } from "./editor/magicWand.worker";
+import type { HistoryTurn, ImageDto } from "./lib/api";
+import { composerMode, pluralize, regionWords, singleTarget } from "./lib/history";
 
 const DEFAULT_REPLY: HistoryTurn["reply"] = {
 	status: "done",
@@ -171,5 +175,133 @@ describe("EditComposer", () => {
 		);
 		fireEvent.keyDown(screen.getByRole("textbox"), { key: "ArrowUp" });
 		expect(onChange).toHaveBeenCalledWith("make the drink green");
+	});
+
+	it("shows Mask badge with Invert button, Batch toggle, and Generative Erase", () => {
+		const onInvert = vi.fn();
+		const onErase = vi.fn();
+		const onToggleBatch = vi.fn();
+		render(
+			<EditComposer
+				imageId="root"
+				imageLabel="photo.jpg"
+				selection={{ x: 0.35, y: 0.35, w: 0.3, h: 0.3 }}
+				hasMask
+				onInvertMask={onInvert}
+				onClearSelection={vi.fn()}
+				value="change jacket to leather"
+				onChange={vi.fn()}
+				onSubmit={vi.fn()}
+				onQuickErase={onErase}
+				onToggleBatchMode={onToggleBatch}
+				busy={false}
+				lastPrompt={null}
+				wantsRegion={false}
+			/>,
+		);
+		expect(screen.getByText(/Mask · center/)).toBeInTheDocument();
+		expect(screen.getByText("Edit masked area")).toBeInTheDocument();
+		fireEvent.click(screen.getByRole("button", { name: "Invert" }));
+		expect(onInvert).toHaveBeenCalled();
+		fireEvent.click(screen.getByRole("button", { name: /Erase object/ }));
+		expect(onErase).toHaveBeenCalled();
+		fireEvent.click(screen.getByRole("button", { name: /\+ Queue chip/ }));
+		expect(onToggleBatch).toHaveBeenCalled();
+	});
+});
+
+describe("Editor depth helpers & panels", () => {
+	it("routes outpaint, style_transfer, remove_bg, enhance, and pluralize accurately", () => {
+		expect(composerMode("remove the background please", false).kind).toBe("remove_bg");
+		expect(composerMode("upscale 4k sharper", false).kind).toBe("enhance");
+		expect(composerMode("extend right side", false).kind).toBe("outpaint");
+		expect(composerMode("match lighting", false, { hasRefs: true }).kind).toBe("style_transfer");
+		expect(pluralize(1, "credit")).toBe("1 credit");
+		expect(pluralize(2, "credit")).toBe("2 credits");
+	});
+
+	it("computes edge-aware Magic Wand region inside a solid colored square", () => {
+		const w = 24;
+		const h = 24;
+		const rgba = new Uint8ClampedArray(w * h * 4);
+		for (let y = 0; y < h; y++) {
+			for (let x = 0; x < w; x++) {
+				const inside = x >= 6 && x < 18 && y >= 6 && y < 18;
+				const idx = (y * w + x) * 4;
+				rgba[idx] = inside ? 230 : 20;
+				rgba[idx + 1] = inside ? 230 : 40;
+				rgba[idx + 2] = inside ? 230 : 80;
+				rgba[idx + 3] = 255;
+			}
+		}
+		const res = computeEdgeAwareWand({ id: 1, width: w, height: h, rgba, seedX: 0.5, seedY: 0.5, tolerance: 25 });
+		expect(res.bbox).toBeTruthy();
+		expect(res.bbox!.x).toBeGreaterThanOrEqual(0.2);
+		expect(res.bbox!.w).toBeLessThan(0.65);
+		expect(res.maskAlpha[12 * w + 12]).toBeGreaterThan(200);
+		expect(res.maskAlpha[0]).toBe(0);
+	});
+
+	it("renders AdjustPanel sliders, BranchRail tree, and ShareDialog", async () => {
+		const onChange = vi.fn();
+		const onBake = vi.fn();
+		render(
+			<AdjustPanel
+				adjustments={{ exposure: 0.5 }}
+				onChange={onChange}
+				onReset={vi.fn()}
+				onBakeToBranch={onBake}
+				onOpenCrop={vi.fn()}
+			/>,
+		);
+		expect(screen.getByText("+0.50")).toBeInTheDocument();
+		fireEvent.click(screen.getByRole("button", { name: "Bake to new branch" }));
+		expect(onBake).toHaveBeenCalled();
+
+		const fam: ImageDto[] = [
+			{
+				id: "img1",
+				albumId: "a1",
+				kind: "upload",
+				widthPx: 100,
+				heightPx: 100,
+				mime: "image/png",
+				sourceImageId: null,
+				currentVersionId: null,
+				filenameLabel: "Root.png",
+				bookmarkedAt: null,
+				segmentStatus: "ready",
+				positionIdx: 0,
+				createdAt: new Date().toISOString(),
+			},
+			{
+				id: "img2",
+				albumId: "a1",
+				kind: "edited",
+				widthPx: 100,
+				heightPx: 100,
+				mime: "image/png",
+				sourceImageId: "img1",
+				currentVersionId: null,
+				filenameLabel: "Edited sky",
+				bookmarkedAt: null,
+				segmentStatus: "none",
+				positionIdx: 1,
+				createdAt: new Date().toISOString(),
+			},
+		];
+		const onOpen = vi.fn();
+		render(<BranchRail family={fam} currentId="img2" onOpen={onOpen} onDuplicate={vi.fn()} />);
+		fireEvent.click(screen.getByRole("button", { name: "Expand branch tree" }));
+		expect(screen.getByText("Edited sky")).toBeInTheDocument();
+		expect(screen.getByText("Branch · L1")).toBeInTheDocument();
+
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => new Response(JSON.stringify({ shares: [] }), { status: 200 })),
+		);
+		render(<ShareDialog imageId="img1" open onClose={vi.fn()} />);
+		await waitFor(() => expect(screen.getByText("No active links yet.")).toBeInTheDocument());
+		vi.unstubAllGlobals();
 	});
 });

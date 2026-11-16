@@ -27,6 +27,7 @@ export interface CaptionedNode {
 	box: DetectedBox;
 	label: string;
 	caption: string;
+	crop?: { data: ArrayBuffer; mime: string };
 	children: CaptionedNode[];
 }
 
@@ -40,7 +41,7 @@ const SCENE_WORDS = new Set([
 ]);
 
 /** Merge near-duplicate boxes: any overlap above IoU 0.85 collapses outright,
- * and same-label boxes above 0.4 collapse too (DETR fires 3-4 times on one
+ * and same-label boxes above 0.3 collapse too (DETR fires 3-4 times on one
  * dog otherwise). The higher-scoring box always wins. */
 export function dedupeBoxes(boxes: DetectedBox[]): DetectedBox[] {
 	const sorted = [...boxes].sort((a, b) => b.score - a.score);
@@ -107,14 +108,19 @@ export async function runDetection(
 ): Promise<DetectedTree> {
 	const provider = getProvider(ctx.env);
 	// ctx.imageBytes is already the downscaled model input (loadModelInput).
-	const rawBoxes = await provider.detect(ctx.imageBytes, ctx.mime);
+	let partial = false;
+	let rawBoxes: DetectedBox[] = [];
+	try {
+		rawBoxes = await provider.detect(ctx.imageBytes, ctx.mime);
+	} catch {
+		partial = true;
+	}
 	const boxes = dedupeBoxes(qualityFilter(rawBoxes, ctx));
 	if (onProgress) await onProgress(25);
 
 	const people = boxes.filter((b) => PERSON_LABELS.has(b.label));
 	const others = boxes.filter((b) => !PERSON_LABELS.has(b.label));
 	const topLevel: DetectedTree["topLevel"] = [];
-	let partial = false;
 
 	for (const person of people) {
 		let children: DetectedBox[] = [];
@@ -147,7 +153,7 @@ export async function runDetection(
 			const guess = await provider.locatePerson(ctx.imageBytes, ctx.mime);
 			if (guess) topLevel.push({ box: guess, children: [] });
 		} catch {
-			// backstop is best-effort
+			partial = true;
 		}
 	}
 
@@ -176,7 +182,7 @@ export async function runDetection(
 		}
 		if (inventory.length > 0 && onProgress) await onProgress(50);
 	} catch {
-		// inventory is additive; detection continues without it
+		partial = true;
 	}
 	return { topLevel, partial };
 }
@@ -223,29 +229,28 @@ export async function runCaptioning(
 	onProgress?: (p: number) => Promise<void> | void,
 ): Promise<{ nodes: CaptionedNode[]; partial: boolean }> {
 	const provider = getProvider(ctx.env);
-	const nodes: CaptionedNode[] = [];
 	let partial = tree.partial;
 	let count = 0;
 
-	for (const node of tree.topLevel) {
-		nodes.push(await captionNode(node.box, node.children, false));
-	}
-	// Post-caption merge: DETR often fires overlapping boxes for the same
-	// subject (person + couch + "man on couch"). When two top-level regions
-	// overlap above IoU 0.6, fold the smaller into the larger and keep its
-	// children attached to the survivor.
-	const merged: CaptionedNode[] = [];
-	for (const node of nodes) {
-		const twin = merged.find((m) => iou(m.box, node.box) > 0.5);
+	// Merge overlapping top-level boxes BEFORE captioning so DETR twin boxes
+	// (e.g. person + couch + "man on couch") don't burn redundant VLM calls.
+	const preMerged: DetectedTree["topLevel"] = [];
+	for (const entry of tree.topLevel) {
+		const twin = preMerged.find((m) => iou(m.box, entry.box) > 0.5);
 		if (twin) {
-			twin.children.push(...node.children);
-			if (node.box.w * node.box.h > twin.box.w * twin.box.h) twin.box = node.box;
+			twin.children.push(...entry.children);
+			if (entry.box.w * entry.box.h > twin.box.w * twin.box.h) twin.box = entry.box;
 		} else {
-			merged.push(node);
+			preMerged.push({ box: entry.box, children: [...entry.children] });
 		}
 	}
+
+	const nodes: CaptionedNode[] = [];
+	for (const node of preMerged) {
+		nodes.push(await captionNode(node.box, node.children, false));
+	}
 	if (onProgress) await onProgress(85);
-	return { nodes: merged, partial };
+	return { nodes, partial };
 
 	async function captionNode(
 		box: DetectedBox,
@@ -255,8 +260,9 @@ export async function runCaptioning(
 		const position = positionWord(box.x + box.w / 2, isChild);
 		let label = box.label;
 		let caption = `A ${box.label} ${position}.`;
+		let crop: { data: ArrayBuffer; mime: string } | undefined;
 		try {
-			const crop = await cropRegion(ctx, box);
+			crop = await cropRegion(ctx, box);
 			const result = await provider.captionRegion(crop.data, crop.mime, box.label, position);
 			if (result.label) label = result.label;
 			caption = result.caption;
@@ -269,6 +275,7 @@ export async function runCaptioning(
 			box,
 			label,
 			caption,
+			crop,
 			children: await Promise.all(
 				children.map((child) => captionNode(child, [], true)),
 			),
@@ -285,50 +292,53 @@ export async function persistSegments(
 	nodes: CaptionedNode[],
 ): Promise<number> {
 	const db = createDb(ctx.env.DB);
-	await db
-		.delete(segments)
+	const keys = mediaKeys(ctx.userId, ctx.albumId, ctx.imageId);
+	const oldAutoRows = await db
+		.select({ id: segments.id })
+		.from(segments)
 		.where(and(eq(segments.imageId, ctx.imageId), isNull(segments.polygonJson)));
 
-	let stored = 0;
+	type SegmentInsert = typeof segments.$inferInsert;
+	const rowsToInsert: SegmentInsert[] = [];
+	const cropsToUpload: Array<{ id: string; box: DetectedBox; crop?: { data: ArrayBuffer; mime: string } }> = [];
 	let nodeIdCounter = 0;
-	for (const node of nodes) {
-		stored += await insertNode(ctx, db, node, null, () => nodeIdCounter++);
-	}
-	return stored;
-}
 
-async function insertNode(
-	ctx: SegmentationContext,
-	db: ReturnType<typeof createDb>,
-	node: CaptionedNode,
-	parentId: string | null,
-	nextOrder: () => number,
-): Promise<number> {
-	const id = crypto.randomUUID();
-	await db.insert(segments).values({
-		id,
-		imageId: ctx.imageId,
-		parentSegmentId: parentId,
-		label: node.label,
-		caption: node.caption,
-		bboxX: node.box.x,
-		bboxY: node.box.y,
-		bboxW: node.box.w,
-		bboxH: node.box.h,
-		orderIdx: nextOrder(),
-	});
-	try {
-		const keys = mediaKeys(ctx.userId, ctx.albumId, ctx.imageId);
-		const crop = await cropRegion(ctx, node.box);
-		await putObject(ctx.env.MEDIA, keys.segmentCrop(id), crop.data, crop.mime);
-	} catch {
-		// thumbnails are cosmetic; never fail persistence on them
+	function collect(node: CaptionedNode, parentId: string | null) {
+		const id = crypto.randomUUID();
+		rowsToInsert.push({
+			id,
+			imageId: ctx.imageId,
+			parentSegmentId: parentId,
+			label: node.label,
+			caption: node.caption,
+			bboxX: node.box.x,
+			bboxY: node.box.y,
+			bboxW: node.box.w,
+			bboxH: node.box.h,
+			orderIdx: nodeIdCounter++,
+		});
+		cropsToUpload.push({ id, box: node.box, crop: node.crop });
+		for (const child of node.children) collect(child, id);
 	}
-	let count = 1;
-	for (const child of node.children) {
-		count += await insertNode(ctx, db, child, id, nextOrder);
+	for (const node of nodes) collect(node, null);
+
+	const deleteStmt = db
+		.delete(segments)
+		.where(and(eq(segments.imageId, ctx.imageId), isNull(segments.polygonJson)));
+	if (rowsToInsert.length > 0) {
+		await db.batch([deleteStmt, db.insert(segments).values(rowsToInsert)]);
+	} else {
+		await deleteStmt;
 	}
-	return count;
+
+	await Promise.allSettled([
+		...oldAutoRows.map((row) => ctx.env.MEDIA.delete(keys.segmentCrop(row.id))),
+		...cropsToUpload.map(async ({ id, box, crop }) => {
+			const c = crop ?? (await cropRegion(ctx, box));
+			await putObject(ctx.env.MEDIA, keys.segmentCrop(id), c.data, c.mime);
+		}),
+	]);
+	return rowsToInsert.length;
 }
 
 export async function markSegmentStatus(

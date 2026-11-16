@@ -57,6 +57,13 @@
       "when": 1790288550971,
       "tag": "0007_editor_history",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1794835948343,
+      "tag": "0008_editor_depth_and_realtime",
+      "breakpoints": true
     }
   ]
 }

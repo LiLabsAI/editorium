@@ -2,9 +2,11 @@ import { eq } from "drizzle-orm";
 
 import { imageVersions, images, type ImageRow } from "../../../database/schema";
 import {
+	IMAGES_INPUT_MAX_BYTES,
 	MODEL_EDIT_MAX_PX,
 	THUMB_VARIANT_PX,
 	WEB_VARIANT_PX,
+	WORKING_MAX_PX,
 } from "./config";
 import { createDb } from "./db";
 import {
@@ -44,13 +46,8 @@ export async function loadImageBytes(
 	return { bytes: await obj.arrayBuffer(), mime: obj.httpMetadata?.contentType ?? image.mime };
 }
 
-/** The Images binding accepts inputs up to 20 MB. */
-const IMAGES_INPUT_MAX_BYTES = 20 * 1024 * 1024;
-/** Longest side of the working copy that pixel operations run on. */
-export const WORKING_MAX_PX = 4096;
-
 /** Current-version bytes the pixel pipeline can accept: the full original,
- * or the (≤1600px) web variant when the original exceeds the Images limit. */
+ * or the (<=1600px) web variant when the original exceeds the Images limit. */
 async function loadPixelSource(env: Env, image: ImageRow): Promise<ArrayBuffer> {
 	const full = await loadImageBytes(env, image);
 	if (full.bytes.byteLength <= IMAGES_INPUT_MAX_BYTES) return full.bytes;
@@ -61,12 +58,16 @@ async function loadPixelSource(env: Env, image: ImageRow): Promise<ArrayBuffer> 
 	const webKey = version?.r2KeyWeb ?? image.r2KeyWeb;
 	const web = webKey ? await env.MEDIA.get(webKey) : null;
 	if (!web) throw new ProviderError("Image too large to process");
-	return web.arrayBuffer();
+	const webBytes = await web.arrayBuffer();
+	if (webBytes.byteLength > IMAGES_INPUT_MAX_BYTES) {
+		throw new ProviderError("Image too large to process");
+	}
+	return webBytes;
 }
 
 /**
  * The working copy for pixel operations: EXIF rotation applied (so region
- * coordinates match what the user saw), longest side ≤ `maxSide`.
+ * coordinates match what the user saw), longest side <= `maxSide`.
  */
 export async function loadWorkingImage(
 	env: Env,
@@ -81,20 +82,49 @@ export async function loadModelInput(env: Env, image: ImageRow): Promise<{ bytes
 	return loadWorkingImage(env, image, MODEL_EDIT_MAX_PX);
 }
 
+/** Header parse, or Images-binding `info()` first on JPEGs so EXIF rotation
+ * is reflected in the displayed width/height before resizing. */
+export async function probeDimensions(env: Env, bytes: ArrayBuffer): Promise<Dims | null> {
+	if (sniffMime(bytes) === "image/jpeg" && typeof env.IMAGES?.info === "function") {
+		try {
+			const stream = new Response(bytes).body;
+			if (stream) {
+				const info = await env.IMAGES.info(stream);
+				if ("width" in info && info.width > 0 && info.height > 0) {
+					return { width: info.width, height: info.height };
+				}
+			}
+		} catch (error) {
+			logWarn("image_info_failed", error);
+		}
+	}
+	const parsed = imageDimensions(bytes);
+	if (parsed) return parsed;
+	try {
+		const stream = new Response(bytes).body;
+		if (!stream || typeof env.IMAGES?.info !== "function") return null;
+		const info = await env.IMAGES.info(stream);
+		if ("width" in info && info.width > 0 && info.height > 0) {
+			return { width: info.width, height: info.height };
+		}
+	} catch (error) {
+		logWarn("image_info_failed", error);
+	}
+	return null;
+}
+
 /** Resize via the Images binding (EXIF rotation is applied); null if unavailable. */
 export async function transformBytes(
 	env: Env,
 	bytes: ArrayBuffer,
 	maxSide: number,
-	format: "image/webp" | "image/jpeg" = "image/webp",
+	format: "image/webp" | "image/jpeg" | "image/png" = "image/webp",
 ): Promise<ArrayBuffer | null> {
 	if (typeof env.IMAGES?.input !== "function") return null;
+	if (bytes.byteLength > IMAGES_INPUT_MAX_BYTES) return null;
 	const stream = new Response(bytes).body;
 	if (!stream) return null;
-	// Explicit, aspect-preserving target size: never upscale, and don't rely
-	// on `fit` alone (the local low-fidelity Images emulator ignores it and
-	// would squash to maxSide x maxSide).
-	const dims = imageDimensions(bytes);
+	const dims = await probeDimensions(env, bytes);
 	let handle = env.IMAGES.input(stream);
 	if (dims) {
 		const scale = Math.min(1, maxSide / Math.max(dims.width, dims.height));
@@ -110,23 +140,6 @@ export async function transformBytes(
 	}
 	const out = await handle.output({ format });
 	return await out.response().arrayBuffer();
-}
-
-/** Header parse first, Images-binding `info()` (free) as the fallback. */
-export async function probeDimensions(env: Env, bytes: ArrayBuffer): Promise<Dims | null> {
-	const parsed = imageDimensions(bytes);
-	if (parsed) return parsed;
-	try {
-		const stream = new Response(bytes).body;
-		if (!stream || typeof env.IMAGES?.info !== "function") return null;
-		const info = await env.IMAGES.info(stream);
-		if ("width" in info && info.width > 0 && info.height > 0) {
-			return { width: info.width, height: info.height };
-		}
-	} catch (error) {
-		logWarn("image_info_failed", error);
-	}
-	return null;
 }
 
 /**
@@ -175,6 +188,34 @@ export async function deriveVariants(
 	return { ...scoped, webDims: webBuf ? imageDimensions(webBuf) : null };
 }
 
+/** Composite an annotation transparent PNG overlay over `base` for exports/shares. */
+export async function compositeOverlay(
+	env: Env,
+	baseBytes: ArrayBuffer,
+	overlayKey: string | null,
+): Promise<{ bytes: ArrayBuffer; mime: string } | null> {
+	if (!overlayKey || typeof env.IMAGES?.input !== "function") return null;
+	const overlayObj = await env.MEDIA.get(overlayKey);
+	if (!overlayObj) return null;
+	try {
+		const dims = await probeDimensions(env, baseBytes);
+		const overlayBytes = await overlayObj.arrayBuffer();
+		let overlayHandle = env.IMAGES.input(new Response(overlayBytes).body!);
+		if (dims) {
+			overlayHandle = overlayHandle.transform({ width: dims.width, height: dims.height, fit: "squeeze" });
+		}
+		const baseMime = sniffMime(baseBytes);
+		const outFormat = baseMime === "image/png" || baseMime === "image/webp" ? "image/png" : "image/jpeg";
+		const out = await env.IMAGES.input(new Response(baseBytes).body!)
+			.draw(overlayHandle, { left: 0, top: 0 })
+			.output(outFormat === "image/jpeg" ? { format: "image/jpeg", quality: 92 } : { format: "image/png" });
+		return { bytes: await out.response().arrayBuffer(), mime: outFormat };
+	} catch (error) {
+		logWarn("overlay_composite_failed", error, { overlayKey });
+		return null;
+	}
+}
+
 export interface NewImage {
 	userId: string;
 	albumId: string;
@@ -187,6 +228,7 @@ export interface NewImage {
 	rootImageId?: string | null;
 	operation: string;
 	prompt?: string;
+	adjustmentsJson?: string | null;
 	/** Dimensions reported by a model; only used if the bytes can't be probed. */
 	fallbackDims?: Dims;
 	audit?: VersionAudit;
@@ -203,8 +245,7 @@ export interface VersionAudit {
 /**
  * The single path that turns bytes into an image: sniff the real format,
  * store the original, derive variants, measure true dimensions, then write
- * the image + version rows atomically. Used by upload, filter presets and
- * every AI result.
+ * the image + version rows atomically. Cleans up written R2 keys if D1 fails.
  */
 export async function createImageFromBytes(
 	env: Env,
@@ -230,42 +271,49 @@ export async function createImageFromBytes(
 		opts.fallbackDims ?? { width: 0, height: 0 };
 
 	const db = createDb(env.DB);
-	const [inserted] = await db.batch([
-		db
-			.insert(images)
-			.values({
-				id: imageId,
-				albumId: opts.albumId,
-				kind: opts.kind,
-				r2KeyOriginal: r2Key,
-				r2KeyWeb: keys.web,
-				r2KeyThumb: keys.thumb,
-				mime,
-				widthPx: dims.width,
-				heightPx: dims.height,
-				sizeBytes: opts.bytes.byteLength,
-				sourceImageId: opts.sourceImageId ?? null,
-				rootImageId: opts.rootImageId ?? imageId,
-				currentVersionId: versionId,
-				filenameLabel: (opts.filenameLabel ?? shortLabel(opts.label)).slice(0, 80),
-				segmentStatus: "none",
-			})
-			.returning(),
-		db.insert(imageVersions).values({
-			id: versionId,
-			imageId,
-			label: opts.label.slice(0, 120),
-			r2KeyFull: r2Key,
-			r2KeyWeb: variants.web,
-			r2KeyThumb: variants.thumb,
-			prompt: opts.prompt,
-			operation: opts.operation,
-			opClass: opts.audit?.opClass,
-			model: opts.audit?.model,
-			fidelity: opts.audit?.fidelity ?? null,
-		}),
-	]);
-	return { image: inserted[0]!, imageId, versionId };
+	try {
+		const [inserted] = await db.batch([
+			db
+				.insert(images)
+				.values({
+					id: imageId,
+					albumId: opts.albumId,
+					kind: opts.kind,
+					r2KeyOriginal: r2Key,
+					r2KeyWeb: keys.web,
+					r2KeyThumb: keys.thumb,
+					mime,
+					widthPx: dims.width,
+					heightPx: dims.height,
+					sizeBytes: opts.bytes.byteLength,
+					sourceImageId: opts.sourceImageId ?? null,
+					rootImageId: opts.rootImageId ?? imageId,
+					currentVersionId: versionId,
+					filenameLabel: (opts.filenameLabel ?? shortLabel(opts.label)).slice(0, 80),
+					adjustmentsJson: opts.adjustmentsJson ?? null,
+					segmentStatus: "none",
+				})
+				.returning(),
+			db.insert(imageVersions).values({
+				id: versionId,
+				imageId,
+				label: opts.label.slice(0, 120),
+				r2KeyFull: r2Key,
+				r2KeyWeb: variants.web,
+				r2KeyThumb: variants.thumb,
+				prompt: opts.prompt,
+				operation: opts.operation,
+				opClass: opts.audit?.opClass,
+				model: opts.audit?.model,
+				fidelity: opts.audit?.fidelity ?? null,
+				adjustmentsJson: opts.adjustmentsJson ?? null,
+			}),
+		]);
+		return { image: inserted[0]!, imageId, versionId };
+	} catch (error) {
+		await deletePrefix(env.MEDIA, keys.prefix).catch(() => undefined);
+		throw error;
+	}
 }
 
 /**

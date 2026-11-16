@@ -27,7 +27,7 @@ export async function readSessionToken(
 	const bytes = fromBase64Url(parts[0]);
 	if (!bytes) return null;
 	const payload = new TextDecoder().decode(bytes);
-	if (!safeEqual(await mac("session", payload, secret), parts[1])) return null;
+	if (!(await safeEqual(await mac("session", payload, secret), parts[1]))) return null;
 	const dot = payload.lastIndexOf(".");
 	if (dot <= 0) return null;
 	const userId = payload.slice(0, dot);

@@ -12,7 +12,14 @@
 	],
 	"observability": {
 		"enabled": true,
-		"head_sampling_rate": 0.1
+		"logs": {
+			"enabled": true,
+			"head_sampling_rate": 1
+		},
+		"traces": {
+			"enabled": true,
+			"head_sampling_rate": 0.1
+		}
 	},
 	"upload_source_maps": true,
 	"assets": {
@@ -51,10 +58,31 @@
 				"queue": "editorium-ai-jobs",
 				"max_batch_size": 1,
 				"max_retries": 3,
+				"max_batch_timeout": 5,
+				"dead_letter_queue": "editorium-ai-jobs-dlq"
+			},
+			{
+				"queue": "editorium-ai-jobs-dlq",
+				"max_batch_size": 5,
+				"max_retries": 1,
 				"max_batch_timeout": 5
 			}
 		]
 	},
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "USER_EVENTS",
+				"class_name": "UserEventsDO"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["UserEventsDO"]
+		}
+	],
 	"workflows": [
 		{
 			"name": "editorium-segment",
@@ -78,6 +106,12 @@
 			"name": "AUTH_LIMITER",
 			"namespace_id": "1002",
 			"simple": { "limit": 5, "period": 60 }
+		},
+		{
+			// Non-AI media & metadata mutations, keyed by user id.
+			"name": "MEDIA_LIMITER",
+			"namespace_id": "1003",
+			"simple": { "limit": 60, "period": 60 }
 		}
 	],
 	/**
@@ -97,11 +131,12 @@
 		"OWNER_USER_ID": "1fbf74ad-5db9-4996-a744-0bc17ce30ad6",
 		"MODEL_EDIT_PRIMARY": "pruna/p-image-edit",
 		"MODEL_DETECT_MOONDREAM": "@cf/moondream/moondream3.1-9B-A2B",
+		"MODEL_DETECT_DETR": "@cf/facebook/detr-resnet-50",
 		"MODEL_VLM": "@cf/meta/llama-3.2-11b-vision-instruct",
-		"MODEL_VLM_SECONDARY": "@cf/zai-org/glm-5.3-flash",
+		"MODEL_VLM_SECONDARY": "@cf/google/gemma-4-26b-a4b-it",
 		"MODEL_EDIT": "@cf/black-forest-labs/flux-2-klein-9b",
-		"MODEL_T2I": "@cf/black-forest-labs/flux-1-schnell",
-		"MODEL_IMG2IMG": "@cf/bytedance/stable-diffusion-xl-lightning",
-		"MODEL_LLM": "@cf/zai-org/glm-5.3-flash"
+		"MODEL_T2I": "@cf/black-forest-labs/flux-2-klein-4b",
+		"MODEL_LLM": "@cf/zai-org/glm-4.7-flash",
+		"MODEL_ROUTER": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 	}
 }

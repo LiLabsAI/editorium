@@ -27,12 +27,13 @@ auth.post("/guest", async (c) => {
 });
 
 auth.post("/claim", async (c) => {
-	const { key } = await readJson(c, z.object({ key: z.string().min(1).max(256) }));
 	if (!(await allow(c.env.AUTH_LIMITER, `claim:${clientIp(c)}`))) fail(429, "rate_limited");
+	const { key } = await readJson(c, z.object({ key: z.string().min(1).max(256) }));
 	const expected = c.env.OWNER_CLAIM_KEY;
 	const ownerId = c.env.OWNER_USER_ID;
-	if (!expected || !ownerId || !safeEqual(key, expected)) fail(403, "invalid_key");
+	if (!expected || !ownerId || !(await safeEqual(key, expected))) fail(403, "invalid_key");
 	const db = createDb(c.env.DB);
+	await db.insert(users).values({ id: ownerId, name: "Owner" }).onConflictDoNothing();
 	const [owner] = await db.select().from(users).where(eq(users.id, ownerId)).limit(1);
 	if (!owner) fail(404, "owner_not_found");
 	c.header("Set-Cookie", sessionCookie(c, await makeSessionToken(owner.id, c.env.AUTH_SECRET)));

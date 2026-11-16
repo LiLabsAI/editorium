@@ -1,7 +1,11 @@
-# E2E: share links
+# E2E: share links & permissions
 
-1. Editor top bar -> Share -> link copied
-2. Open /s/:token in a logged-out context
-   ASSERT: image renders with download button and "Made with Editorium"
-3. Revoke the link (owner)
-   ASSERT: /s/:token shows "expired or revoked"
+1. Editor TopBar -> click "Share" to open the Share dialog
+2. Toggle "Allow full-resolution download", optionally pick expiry, click "Create & copy link"
+   ASSERT: new share link appears under "Active share links" and URL copies to clipboard
+3. Open /s/:token in a logged-out context (no cookie)
+   ASSERT: image renders cleanly with non-destructive adjustments & "Download" button + "Made with Editorium"
+4. Click "Open Editorium" link on SharePage -> navigates cleanly to / and bootstraps guest session
+5. Back in Share dialog (owner): click "Revoke" on the active link
+6. Reload /s/:token
+   ASSERT: shows "This link has expired or was revoked."
