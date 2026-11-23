@@ -96,6 +96,7 @@ export function EditorCanvas({
 	onDeleteAnnotation,
 	highlights = [],
 	sourceUrl,
+	onImageLoaded,
 }: {
 	ref?: React.Ref<CanvasHandle>;
 	image: ImageDto;
@@ -115,8 +116,11 @@ export function EditorCanvas({
 	onDeleteAnnotation?: (id: string) => void;
 	highlights?: Bbox[];
 	sourceUrl?: string;
+	onImageLoaded?: (img: HTMLImageElement) => void;
 }) {
 	const editor = useEditorState();
+	const onImageLoadedRef = useRef(onImageLoaded);
+	onImageLoadedRef.current = onImageLoaded;
 	const containerRef = useRef<HTMLDivElement>(null);
 	const imgRef = useRef<HTMLImageElement>(null);
 	const glCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -198,6 +202,7 @@ export function EditorCanvas({
 		webImg.crossOrigin = "anonymous";
 		webImg.onload = () => {
 			uploadToGl(webImg);
+			if (!cancelled) onImageLoadedRef.current?.(webImg);
 			if (origUrl !== webUrl) {
 				const origImg = new Image();
 				origImg.crossOrigin = "anonymous";

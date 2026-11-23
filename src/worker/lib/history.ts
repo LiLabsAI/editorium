@@ -73,6 +73,8 @@ export async function recordAction(
 		resultImageId?: string;
 		replyText?: string;
 		threadId?: string;
+		presetId?: string | null;
+		presetName?: string | null;
 	},
 ): Promise<{ threadId: string; requestId: string; replyId: string }> {
 	const threadId = opts.threadId ?? (await ensureFamilyThread(db, opts.image));
@@ -84,6 +86,8 @@ export async function recordAction(
 		rootImageId: familyRoot(opts.image),
 		opClass: opts.opClass,
 		jobId: opts.jobId ?? null,
+		presetId: opts.presetId ?? null,
+		presetName: opts.presetName ?? null,
 	};
 	await db.batch([
 		db.insert(chatMessages).values({
@@ -121,6 +125,8 @@ export interface HistoryTurn {
 		opClass: OpClass | null;
 		bboxes: Box[];
 		imageId: string | null;
+		presetId?: string | null;
+		presetName?: string | null;
 	};
 	reply: {
 		status: TurnStatus;
@@ -135,6 +141,8 @@ export interface HistoryTurn {
 			opClass: string | null;
 			model: string | null;
 			fidelity: number | null;
+			presetId?: string | null;
+			presetName?: string | null;
 			exists: boolean;
 		} | null;
 	};
@@ -216,6 +224,8 @@ export async function familyHistory(env: Env, image: ImageRow): Promise<{ rootIm
 			opClass: row?.version?.opClass ?? null,
 			model: row?.version?.model ?? null,
 			fidelity: row?.version?.fidelity ?? null,
+			presetId: row?.version?.presetId ?? null,
+			presetName: row?.version?.presetName ?? null,
 			exists: !!row,
 		};
 	};
@@ -253,6 +263,8 @@ export async function familyHistory(env: Env, image: ImageRow): Promise<{ rootIm
 				opClass: (request.opClass as OpClass | null) ?? null,
 				bboxes: parseBoxes(request.bboxJson),
 				imageId: request.imageId,
+				presetId: request.presetId ?? null,
+				presetName: request.presetName ?? null,
 			},
 			reply: {
 				status,

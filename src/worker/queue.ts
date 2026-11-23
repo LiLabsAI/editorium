@@ -16,12 +16,14 @@ import {
 	runInpaintJob,
 	runLocalEdit,
 	runOutpaintJob,
+	runPresetJob,
 	runRemoveBackgroundJob,
 	runSegmentation,
 	runWholePhotoEdit,
 	type JobResult,
 	type OutpaintPad,
 } from "./workflows";
+import type { PresetTargetScope } from "../shared/presets";
 
 // max_retries = 3 in wrangler.json allows 1 initial delivery + 3 retries (attempts 1..4).
 const MAX_ATTEMPTS = 4;
@@ -49,6 +51,13 @@ export interface AiJobMessage {
 	origin?: string;
 	/** Chat message to link the result onto (agent-initiated jobs). */
 	chatMessageId?: string;
+	/** Server-resolved hidden-prompt preset metadata. */
+	presetId?: string;
+	presetName?: string;
+	presetScope?: PresetTargetScope;
+	presetOpClass?: "reimagine" | "style_transfer";
+	presetPreferredModel?: "primary" | "flux";
+	finishingAdjustmentsJson?: string | null;
 }
 
 type Db = ReturnType<typeof createDb>;
@@ -81,6 +90,23 @@ async function dispatch(env: Env, db: Db, msg: AiJobMessage): Promise<JobResult 
 			return runRemoveBackgroundJob(env, msg.userId, await loadImage(db, msg.imageId));
 		case "inpaint": {
 			const image = await loadImage(db, msg.imageId);
+			if (msg.presetId) {
+				if (!msg.prompt) throw new ProviderError("preset job has no compiled prompt");
+				return runPresetJob(env, msg.userId, image, {
+					presetId: msg.presetId,
+					presetName: msg.presetName ?? msg.label ?? "Preset",
+					prompt: msg.prompt,
+					targetScope: msg.presetScope ?? "whole",
+					opClass: msg.presetOpClass ?? "reimagine",
+					preferredModel: msg.presetPreferredModel,
+					finishingAdjustmentsJson: msg.finishingAdjustmentsJson ?? null,
+					regionBox: msg.regionBox,
+					maskR2Key: msg.maskR2Key,
+					segmentId: msg.segmentId,
+					referenceImageIds: msg.referenceImageIds,
+					origin: msg.origin,
+				});
+			}
 			if (msg.segmentId) {
 				return runInpaintJob(env, msg.userId, image, msg.segmentId, msg.prompt ?? "");
 			}

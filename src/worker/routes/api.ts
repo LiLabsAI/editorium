@@ -14,6 +14,7 @@ import {
 	images,
 	jobs,
 	palettes,
+	presets,
 	projects,
 	references,
 	segmentPrompts,
@@ -22,6 +23,15 @@ import {
 	type ImageRow,
 	type ImageVersion,
 } from "../../../database/schema";
+import { extractGrade } from "../../shared/presets";
+import {
+	BUILT_IN_PRESET_DTOS,
+	compilePresetPrompt,
+	findBuiltInPreset,
+	isBuiltInPresetId,
+	resolveCustomPresetRow,
+	slugifyPresetName,
+} from "../lib/presets";
 import { streamAgentResponse } from "../agent";
 import { notifyUserEvent } from "../events";
 import { ensureProject, getUser, requireUser } from "../lib/auth";
@@ -168,8 +178,18 @@ const adjustmentsSchema = z
 		saturation: z.number().finite().min(-1).max(1).optional(),
 		clarity: z.number().finite().min(-1).max(1).optional(),
 		vignette: z.number().finite().min(0).max(1).optional(),
+		fade: z.number().finite().min(0).max(1).optional(),
+		grain: z.number().finite().min(0).max(1).optional(),
+		sepia: z.number().finite().min(0).max(1).optional(),
+		bloom: z.number().finite().min(0).max(1).optional(),
+		splitShadowHue: z.number().finite().min(0).max(360).optional(),
+		splitShadowAmt: z.number().finite().min(0).max(1).optional(),
+		splitHighlightHue: z.number().finite().min(0).max(360).optional(),
+		splitHighlightAmt: z.number().finite().min(0).max(1).optional(),
+		presetId: z.string().min(1).max(80).optional(),
+		presetIntensity: z.number().finite().min(0).max(1).optional(),
 		straighten: z.number().finite().min(-45).max(45).optional(),
-		rotate90: z.number().int().min(0).max(3).optional(),
+		rotate90: z.union([z.literal(0), z.literal(1), z.literal(2), z.literal(3)]).optional(),
 		flipH: z.boolean().optional(),
 		flipV: z.boolean().optional(),
 		crop: bboxSchema.optional(),
@@ -208,7 +228,14 @@ async function startJob(
 	type: Exclude<JobType, "caption" | "thumb">,
 	message: Omit<AiJobMessage, "jobId" | "type" | "userId">,
 	payload?: Record<string, unknown>,
-	history?: { image: ImageRow; text: string; opClass: OpClass; bboxes?: Box[] },
+	history?: {
+		image: ImageRow;
+		text: string;
+		opClass: OpClass;
+		bboxes?: Box[];
+		presetId?: string | null;
+		presetName?: string | null;
+	},
 ): Promise<string> {
 	await requireAiQuota(c.env, userId);
 	const db = createDb(c.env.DB);
@@ -685,6 +712,8 @@ api.post("/images/:id/filter-branch", async (c) => {
 	const file = form["file"];
 	const label = String(form["label"] ?? "Filtered").trim().slice(0, 60) || "Filtered";
 	const rawAdj = typeof form["adjustmentsJson"] === "string" ? form["adjustmentsJson"] : null;
+	const presetId = typeof form["presetId"] === "string" ? form["presetId"].trim().slice(0, 80) || null : null;
+	const presetName = typeof form["presetName"] === "string" ? form["presetName"].trim().slice(0, 60) || null : null;
 	if (!(file instanceof File)) fail(400, "file_required");
 	if (file.size === 0 || file.size > MAX_UPLOAD_BYTES) fail(413, "invalid_file");
 	const bytes = await file.arrayBuffer();
@@ -697,12 +726,21 @@ api.post("/images/:id/filter-branch", async (c) => {
 		label,
 		sourceImageId: row.image.id,
 		rootImageId: row.image.rootImageId ?? row.image.id,
-		operation: "filter",
+		operation: presetId ? "preset" : "filter",
 		adjustmentsJson: rawAdj,
+		presetId,
+		presetName,
 		audit: { opClass: "adjust", model: "client:canvas" },
 	});
 	// Instant operation: recorded already finished.
-	await recordAction(createDb(c.env.DB), { image: row.image, text: label, opClass: "adjust", resultImageId: imageId });
+	await recordAction(createDb(c.env.DB), {
+		image: row.image,
+		text: presetName ? `Filter: ${presetName}` : label,
+		opClass: "adjust",
+		resultImageId: imageId,
+		presetId,
+		presetName,
+	});
 	return c.json({ imageId, versionId }, 201);
 });
 
@@ -1772,6 +1810,307 @@ api.delete("/annotations/:id", async (c) => {
 });
 
 // Usage (plan 13)
+// ---------------------------------------------------------------------------
+// Presets (Instant GPU Filters + Server-Resolved Hidden-Prompt AI Effects)
+// ---------------------------------------------------------------------------
+
+const presetCategorySchema = z.enum([
+	"film",
+	"cinematic",
+	"bw",
+	"portrait",
+	"relight",
+	"backdrop",
+	"artistic",
+	"custom",
+]);
+const presetKindSchema = z.enum(["filter", "ai_effect", "hybrid"]);
+const presetScopeSchema = z.enum(["whole", "background", "subject", "selection"]);
+const presetOpClassSchema = z.enum(["reimagine", "style_transfer"]);
+const presetIntensitySchema = z.enum(["subtle", "balanced", "bold"]);
+const MAX_CUSTOM_PRESETS = 100;
+
+api.get("/presets", async (c) => {
+	const user = await requireUser(c);
+	const project = await ensureProject(c, user);
+	const db = createDb(c.env.DB);
+	const rows = await db
+		.select()
+		.from(presets)
+		.where(and(eq(presets.projectId, project.id), eq(presets.ownerId, user.id)))
+		.orderBy(desc(presets.isFavorite), desc(presets.createdAt));
+	const custom = rows.map((r) => resolveCustomPresetRow(r).dto);
+	return c.json({ presets: [...BUILT_IN_PRESET_DTOS, ...custom] });
+});
+
+api.post("/presets", async (c) => {
+	const user = await requireUser(c);
+	const project = await ensureProject(c, user);
+	await requireMediaQuota(c.env, user.id);
+	const body = await readJson(
+		c,
+		z.object({
+			name: z.string().trim().min(1).max(48),
+			category: presetCategorySchema.optional(),
+			kind: presetKindSchema,
+			description: z.string().trim().max(160).optional(),
+			adjustments: adjustmentsSchema.optional(),
+			promptTemplate: z.string().trim().min(3).max(400).optional(),
+			targetScope: presetScopeSchema.optional(),
+			opClass: presetOpClassSchema.optional(),
+			defaultIntensity: presetIntensitySchema.optional(),
+		}),
+	);
+
+	const grade = body.adjustments ? extractGrade(body.adjustments) : undefined;
+	const hasGrade = Boolean(grade && Object.keys(grade).length > 0);
+	if (body.kind === "filter" && !hasGrade) fail(400, "invalid_body");
+	if ((body.kind === "ai_effect" || body.kind === "hybrid") && !body.promptTemplate) fail(400, "invalid_body");
+
+	const db = createDb(c.env.DB);
+	const existing = await db
+		.select({ id: presets.id })
+		.from(presets)
+		.where(and(eq(presets.projectId, project.id), eq(presets.ownerId, user.id)))
+		.limit(MAX_CUSTOM_PRESETS);
+	if (existing.length >= MAX_CUSTOM_PRESETS) fail(429, "quota_exceeded");
+
+	const id = crypto.randomUUID();
+	const now = new Date();
+	const [created] = await db
+		.insert(presets)
+		.values({
+			id,
+			projectId: project.id,
+			ownerId: user.id,
+			name: body.name,
+			slug: slugifyPresetName(body.name),
+			category: body.category ?? "custom",
+			kind: body.kind,
+			description: body.description ?? "",
+			adjustmentsJson: hasGrade ? JSON.stringify(grade) : null,
+			promptTemplate: body.kind === "filter" ? null : (body.promptTemplate ?? null),
+			targetScope: body.targetScope ?? "whole",
+			opClass: body.opClass ?? "reimagine",
+			defaultIntensity: body.defaultIntensity ?? "balanced",
+			isFavorite: false,
+			createdAt: now,
+			updatedAt: now,
+		})
+		.returning();
+	return c.json({ preset: resolveCustomPresetRow(created!).dto }, 201);
+});
+
+api.patch("/presets/:id", async (c) => {
+	const user = await requireUser(c);
+	const id = c.req.param("id");
+	if (isBuiltInPresetId(id)) fail(400, "builtin_immutable");
+	const body = await readJson(
+		c,
+		z.object({
+			name: z.string().trim().min(1).max(48).optional(),
+			category: presetCategorySchema.optional(),
+			description: z.string().trim().max(160).optional(),
+			adjustments: adjustmentsSchema.nullable().optional(),
+			promptTemplate: z.string().trim().min(3).max(400).nullable().optional(),
+			targetScope: presetScopeSchema.optional(),
+			opClass: presetOpClassSchema.optional(),
+			defaultIntensity: presetIntensitySchema.optional(),
+			isFavorite: z.boolean().optional(),
+		}),
+	);
+	if (!hasAnyValue(body)) fail(400, "empty_patch");
+	const db = createDb(c.env.DB);
+	const [existing] = await db
+		.select()
+		.from(presets)
+		.where(and(eq(presets.id, id), eq(presets.ownerId, user.id)))
+		.limit(1);
+	if (!existing) fail(404, "preset_not_found");
+
+	let nextAdjJson: string | null | undefined = undefined;
+	if (body.adjustments !== undefined) {
+		if (body.adjustments === null) {
+			nextAdjJson = null;
+		} else {
+			const grade = extractGrade(body.adjustments);
+			nextAdjJson = Object.keys(grade).length > 0 ? JSON.stringify(grade) : null;
+		}
+	}
+	if (existing.kind === "filter" && nextAdjJson === null) fail(400, "invalid_body");
+	if ((existing.kind === "ai_effect" || existing.kind === "hybrid") && body.promptTemplate === null) {
+		fail(400, "invalid_body");
+	}
+
+	const [updated] = await db
+		.update(presets)
+		.set({
+			...(body.name !== undefined ? { name: body.name, slug: slugifyPresetName(body.name) } : {}),
+			...(body.category !== undefined ? { category: body.category } : {}),
+			...(body.description !== undefined ? { description: body.description } : {}),
+			...(nextAdjJson !== undefined ? { adjustmentsJson: nextAdjJson } : {}),
+			...(body.promptTemplate !== undefined ? { promptTemplate: body.promptTemplate } : {}),
+			...(body.targetScope !== undefined ? { targetScope: body.targetScope } : {}),
+			...(body.opClass !== undefined ? { opClass: body.opClass } : {}),
+			...(body.defaultIntensity !== undefined ? { defaultIntensity: body.defaultIntensity } : {}),
+			...(body.isFavorite !== undefined ? { isFavorite: body.isFavorite } : {}),
+			updatedAt: new Date(),
+		})
+		.where(and(eq(presets.id, id), eq(presets.ownerId, user.id)))
+		.returning();
+	return c.json({ preset: resolveCustomPresetRow(updated!).dto });
+});
+
+api.delete("/presets/:id", async (c) => {
+	const user = await requireUser(c);
+	const id = c.req.param("id");
+	if (isBuiltInPresetId(id)) fail(400, "builtin_immutable");
+	const db = createDb(c.env.DB);
+	const deleted = await db
+		.delete(presets)
+		.where(and(eq(presets.id, id), eq(presets.ownerId, user.id)))
+		.returning({ id: presets.id });
+	if (!deleted.length) fail(404, "preset_not_found");
+	return c.json({ ok: true });
+});
+
+api.post("/images/:id/apply-preset", async (c) => {
+	const user = await requireUser(c);
+	const row = await requireImage(c, user.id);
+	const body = await readJson(
+		c,
+		z.object({
+			presetId: z.string().min(1).max(80),
+			intensity: presetIntensitySchema.optional(),
+			extraPrompt: z.string().trim().max(200).optional(),
+			bbox: bboxSchema.optional(),
+			maskPngBase64: z.string().min(16).max(3_000_000).optional(),
+			segmentId: idSchema.optional(),
+			referenceImageIds: z.array(idSchema).max(3).optional(),
+			paletteIds: z.array(idSchema).max(3).optional(),
+		}),
+	);
+
+	const db = createDb(c.env.DB);
+	let resolved = findBuiltInPreset(body.presetId);
+	if (!resolved) {
+		const [customRow] = await db
+			.select()
+			.from(presets)
+			.where(and(eq(presets.id, body.presetId), eq(presets.ownerId, user.id)))
+			.limit(1);
+		if (!customRow) fail(404, "preset_not_found");
+		resolved = resolveCustomPresetRow(customRow);
+	}
+	if (resolved.dto.kind === "filter" || !resolved.recipe) {
+		fail(400, "preset_requires_ai");
+	}
+
+	// Validate optional segment ownership & lock state before charging credits.
+	let historyBoxes: Box[] | undefined;
+	if (body.segmentId) {
+		const segRow = await ownedSegment(c.env, user.id, body.segmentId);
+		if (!segRow || segRow.segment.imageId !== row.image.id || segRow.segment.deletedAt) fail(404, "not_found");
+		if (segRow.segment.lockedAt) fail(409, "segment_locked");
+		historyBoxes = [
+			{
+				x: segRow.segment.bboxX,
+				y: segRow.segment.bboxY,
+				w: segRow.segment.bboxW,
+				h: segRow.segment.bboxH,
+			},
+		];
+	} else if (body.bbox) {
+		historyBoxes = [body.bbox];
+	}
+
+	// Optional mask PNG upload to R2 for brush/lasso/wand scoped preset effects.
+	let maskR2Key: string | undefined;
+	if (body.maskPngBase64) {
+		const maskBuf = decodeBase64Png(body.maskPngBase64);
+		maskR2Key = `${albumPrefix(user.id, row.album.id)}i/${row.image.id}/masks/${crypto.randomUUID()}.png`;
+		await putObject(c.env.MEDIA, maskR2Key, maskBuf, "image/png");
+	}
+
+	// Optional attached user color palettes harmonized into the hidden prompt.
+	const paletteHexes: string[] = [];
+	if (body.paletteIds?.length) {
+		const palRows = await db
+			.select({ colorsJson: palettes.colorsJson })
+			.from(palettes)
+			.where(and(eq(palettes.ownerId, user.id), inArray(palettes.id, body.paletteIds)));
+		for (const p of palRows) {
+			try {
+				const arr = JSON.parse(p.colorsJson) as unknown;
+				if (Array.isArray(arr)) {
+					for (const hex of arr) if (typeof hex === "string") paletteHexes.push(hex);
+				}
+			} catch {
+				// skip malformed palette
+			}
+		}
+	}
+
+	const intensity = body.intensity ?? resolved.dto.aiMeta?.defaultIntensity ?? "balanced";
+	const hasSelection = Boolean(body.segmentId || body.bbox || maskR2Key);
+	const compiledPrompt = compilePresetPrompt(resolved.recipe, {
+		intensity,
+		extraPrompt: body.extraPrompt,
+		paletteHexes,
+		hasUserMask: hasSelection,
+	});
+
+	const finishingAdjustmentsJson =
+		resolved.dto.kind === "hybrid" && resolved.dto.adjustments
+			? JSON.stringify({ ...resolved.dto.adjustments, presetId: resolved.dto.id, presetIntensity: 1 })
+			: null;
+
+	const historyOpClass: OpClass = hasSelection ? "local" : resolved.recipe.opClass;
+	const intensityLabel = intensity.charAt(0).toUpperCase() + intensity.slice(1);
+	const historyText = body.extraPrompt
+		? `Preset: ${resolved.dto.name} (${intensityLabel}) · ${body.extraPrompt}`
+		: `Preset: ${resolved.dto.name} (${intensityLabel})`;
+
+	const jobId = await startJob(
+		c,
+		user.id,
+		"inpaint",
+		{
+			imageId: row.image.id,
+			prompt: compiledPrompt,
+			segmentId: body.segmentId,
+			regionBox: body.bbox,
+			maskR2Key,
+			referenceImageIds: body.referenceImageIds,
+			label: resolved.dto.name,
+			origin: origin(c),
+			presetId: resolved.dto.id,
+			presetName: resolved.dto.name,
+			presetScope: hasSelection ? "selection" : resolved.recipe.targetScope,
+			presetOpClass: resolved.recipe.opClass,
+			presetPreferredModel: resolved.recipe.preferredModel,
+			finishingAdjustmentsJson,
+		},
+		{
+			presetId: resolved.dto.id,
+			presetName: resolved.dto.name,
+			intensity,
+			extraPrompt: body.extraPrompt,
+			targetScope: hasSelection ? "selection" : resolved.recipe.targetScope,
+		},
+		{
+			image: row.image,
+			text: historyText,
+			opClass: historyOpClass,
+			bboxes: historyBoxes,
+			presetId: resolved.dto.id,
+			presetName: resolved.dto.name,
+		},
+	);
+
+	return c.json({ jobId, presetName: resolved.dto.name }, 202);
+});
+
 api.get("/usage", async (c) => {
 	const user = await requireUser(c);
 	const db = createDb(c.env.DB);

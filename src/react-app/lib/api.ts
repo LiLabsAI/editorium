@@ -1,4 +1,25 @@
+import type {
+	Box,
+	ImageAdjustments,
+	PortablePresetRecipe,
+	PresetCategory,
+	PresetDto,
+	PresetIntensity,
+	PresetKind,
+	PresetTargetScope,
+} from "../../shared/presets";
 import { jobEvents, type JobRealtimeEvent } from "./events";
+
+export type {
+	Box,
+	ImageAdjustments,
+	PortablePresetRecipe,
+	PresetCategory,
+	PresetDto,
+	PresetIntensity,
+	PresetKind,
+	PresetTargetScope,
+};
 
 /** Typed fetch client for the Editorium API. */
 
@@ -14,24 +35,6 @@ export interface AlbumSummary {
 export interface Me {
 	user: { id: string; name: string; plan: string; credits: number } | null;
 	project?: { id: string; name: string };
-}
-
-export interface ImageAdjustments {
-	exposure?: number;
-	contrast?: number;
-	highlights?: number;
-	shadows?: number;
-	temperature?: number;
-	tint?: number;
-	vibrance?: number;
-	saturation?: number;
-	clarity?: number;
-	vignette?: number;
-	straighten?: number;
-	rotate90?: 0 | 1 | 2 | 3;
-	flipH?: boolean;
-	flipV?: boolean;
-	crop?: Box;
 }
 
 export interface ImageDto {
@@ -130,8 +133,6 @@ export interface JobDto {
 	resultImageId: string | null;
 }
 
-export type Box = { x: number; y: number; w: number; h: number };
-
 export interface EditInstructionDto {
 	id: string;
 	text: string;
@@ -178,7 +179,14 @@ export interface HistoryTurn {
 	id: string;
 	createdAt: string;
 	derived: boolean;
-	request: { text: string; opClass: OpClass | null; bboxes: Box[]; imageId: string | null };
+	request: {
+		text: string;
+		opClass: OpClass | null;
+		bboxes: Box[];
+		imageId: string | null;
+		presetId?: string | null;
+		presetName?: string | null;
+	};
 	reply: {
 		status: "queued" | "running" | "done" | "error";
 		text: string;
@@ -191,6 +199,8 @@ export interface HistoryTurn {
 			opClass: string | null;
 			model: string | null;
 			fidelity: number | null;
+			presetId?: string | null;
+			presetName?: string | null;
 			exists: boolean;
 		} | null;
 	};
@@ -238,6 +248,9 @@ export function describeError(err: unknown): string {
 		dimensions_exceed_limit: "Expanded dimensions exceed the 4096px maximum.",
 		download_disabled: "Downloads are disabled on this share link.",
 		invalid_key: "That owner key isn't valid.",
+		preset_not_found: "That preset no longer exists.",
+		preset_requires_ai: "Filter presets apply instantly in the canvas without running an AI job.",
+		builtin_immutable: "Built-in presets cannot be modified or deleted.",
 	};
 	return messages[code] ?? "Something went wrong. Please try again.";
 }
@@ -410,11 +423,21 @@ export const api = {
 		),
 	branchFamily: (imageId: string) =>
 		request<{ images: ImageDto[]; rootId?: string }>(`/images/${encodeURIComponent(imageId)}/branch`),
-	filterBranch: async (imageId: string, label: string, blob: Blob, adjustmentsJson?: string) => {
+	filterBranch: async (
+		imageId: string,
+		label: string,
+		blob: Blob,
+		adjustmentsJson?: string,
+		preset?: { id: string; name: string },
+	) => {
 		const form = new FormData();
 		form.append("file", blob, "filtered.png");
 		form.append("label", label);
 		if (adjustmentsJson) form.append("adjustmentsJson", adjustmentsJson);
+		if (preset) {
+			form.append("presetId", preset.id);
+			form.append("presetName", preset.name);
+		}
 		const res = await fetch(`/api/images/${encodeURIComponent(imageId)}/filter-branch`, {
 			method: "POST",
 			body: form,
@@ -540,6 +563,60 @@ export const api = {
 
 	usage: () =>
 		request<{ balance: number; events: Array<{ reason: string; total: number; credits: number }> }>("/usage"),
+
+	presets: () => request<{ presets: PresetDto[] }>("/presets"),
+	createPreset: (body: {
+		name: string;
+		category?: PresetCategory;
+		kind: PresetKind;
+		description?: string;
+		adjustments?: ImageAdjustments;
+		promptTemplate?: string;
+		targetScope?: PresetTargetScope;
+		opClass?: "reimagine" | "style_transfer";
+		defaultIntensity?: PresetIntensity;
+	}) =>
+		request<{ preset: PresetDto }>("/presets", {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
+	updatePreset: (
+		id: string,
+		body: {
+			name?: string;
+			category?: PresetCategory;
+			description?: string;
+			adjustments?: ImageAdjustments | null;
+			promptTemplate?: string | null;
+			targetScope?: PresetTargetScope;
+			opClass?: "reimagine" | "style_transfer";
+			defaultIntensity?: PresetIntensity;
+			isFavorite?: boolean;
+		},
+	) =>
+		request<{ preset: PresetDto }>(`/presets/${encodeURIComponent(id)}`, {
+			method: "PATCH",
+			body: JSON.stringify(body),
+		}),
+	deletePreset: (id: string) =>
+		request<{ ok: boolean }>(`/presets/${encodeURIComponent(id)}`, { method: "DELETE" }),
+	applyPreset: (
+		imageId: string,
+		body: {
+			presetId: string;
+			intensity?: PresetIntensity;
+			extraPrompt?: string;
+			bbox?: Box;
+			maskPngBase64?: string;
+			segmentId?: string;
+			referenceImageIds?: string[];
+			paletteIds?: string[];
+		},
+	) =>
+		request<{ jobId: string; presetName: string }>(`/images/${encodeURIComponent(imageId)}/apply-preset`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
 };
 
 export function fileUrl(

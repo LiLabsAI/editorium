@@ -33,6 +33,7 @@ export function HistoryPanel({
 	onEditPrompt,
 	onRegionize,
 	onHighlight,
+	onSaveAsPreset,
 }: {
 	turns: HistoryTurn[];
 	live: LiveTurn | null;
@@ -42,6 +43,7 @@ export function HistoryPanel({
 	onEditPrompt: (text: string) => void;
 	onRegionize: (text: string) => void;
 	onHighlight: (boxes: Box[]) => void;
+	onSaveAsPreset?: (prompt: string) => void;
 }) {
 	const [filter, setFilter] = useState<HistoryFilter>("all");
 	const scroller = useRef<HTMLDivElement>(null);
@@ -97,6 +99,7 @@ export function HistoryPanel({
 						onEditPrompt={onEditPrompt}
 						onRegionize={onRegionize}
 						onHighlight={onHighlight}
+						onSaveAsPreset={onSaveAsPreset}
 					/>
 				))}
 				{live && (
@@ -160,6 +163,7 @@ function TurnView({
 	onEditPrompt,
 	onRegionize,
 	onHighlight,
+	onSaveAsPreset,
 }: {
 	turn: HistoryTurn;
 	currentImageId: string;
@@ -168,6 +172,7 @@ function TurnView({
 	onEditPrompt: (text: string) => void;
 	onRegionize: (text: string) => void;
 	onHighlight: (boxes: Box[]) => void;
+	onSaveAsPreset?: (prompt: string) => void;
 }) {
 	const { request, reply } = turn;
 	const cls = request.opClass;
@@ -185,7 +190,8 @@ function TurnView({
 	}
 
 	const region = request.bboxes.length ? ` · ${request.bboxes.map(regionWords).join(", ")}` : "";
-	const chip = cls && cls !== "answer" ? `${CLASS_LABEL[cls]}${region}` : null;
+	const presetTag = request.presetName ? `Preset · ${request.presetName}` : null;
+	const chip = cls && cls !== "answer" ? [presetTag, `${CLASS_LABEL[cls]}${region}`].filter(Boolean).join(" · ") : presetTag;
 
 	return (
 		<div
@@ -202,8 +208,10 @@ function TurnView({
 					{reply.refunded && <p className="mt-0.5 text-muted-foreground">{pluralize(reply.credits, "credit")} refunded</p>}
 					<Actions>
 						{canRetry(turn) && <Action onClick={() => onRetry(turn)}>Retry</Action>}
-						{cls === "reimagine" && <Action onClick={() => onRegionize(request.text)}>Redo on a region</Action>}
-						<Action onClick={() => onEditPrompt(request.text)}>Edit prompt</Action>
+						{cls === "reimagine" && !request.presetId && (
+							<Action onClick={() => onRegionize(request.text)}>Redo on a region</Action>
+						)}
+						{!request.presetId && <Action onClick={() => onEditPrompt(request.text)}>Edit prompt</Action>}
 					</Actions>
 				</div>
 			) : reply.result ? (
@@ -221,10 +229,15 @@ function TurnView({
 					onOpen={onOpen}
 				>
 					{canRetry(turn) && <Action onClick={() => onRetry(turn)}>Retry</Action>}
-					{(cls === "reimagine" || cls === "style_transfer") && (
+					{(cls === "reimagine" || cls === "style_transfer") && !request.presetId && (
 						<Action onClick={() => onRegionize(request.text)}>Redo on a region</Action>
 					)}
-					{!turn.derived && cls !== "adjust" && <Action onClick={() => onEditPrompt(request.text)}>Edit prompt</Action>}
+					{!turn.derived && cls !== "adjust" && !request.presetId && (
+						<Action onClick={() => onEditPrompt(request.text)}>Edit prompt</Action>
+					)}
+					{onSaveAsPreset && !turn.derived && !request.presetId && (cls === "reimagine" || cls === "style_transfer" || cls === "local") && (
+						<Action onClick={() => onSaveAsPreset(request.text)}>Save as preset</Action>
+					)}
 				</ResultRow>
 			) : (
 				<p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground/90">{reply.text}</p>

@@ -12,6 +12,14 @@ type NumericKey =
 	| "saturation"
 	| "clarity"
 	| "vignette"
+	| "fade"
+	| "grain"
+	| "bloom"
+	| "sepia"
+	| "splitShadowHue"
+	| "splitShadowAmt"
+	| "splitHighlightHue"
+	| "splitHighlightAmt"
 	| "straighten";
 
 interface SliderSpec {
@@ -20,6 +28,7 @@ interface SliderSpec {
 	min: number;
 	max: number;
 	step: number;
+	unit?: string;
 }
 
 const SLIDER_GROUPS: Array<{ title: string; items: SliderSpec[] }> = [
@@ -42,10 +51,23 @@ const SLIDER_GROUPS: Array<{ title: string; items: SliderSpec[] }> = [
 		],
 	},
 	{
-		title: "Detail",
+		title: "Detail & Film",
 		items: [
 			{ key: "clarity", label: "Clarity", min: -1, max: 1, step: 0.02 },
+			{ key: "fade", label: "Matte Fade", min: 0, max: 1, step: 0.02 },
+			{ key: "grain", label: "Film Grain", min: 0, max: 1, step: 0.02 },
+			{ key: "bloom", label: "Glow / Halation", min: 0, max: 1, step: 0.02 },
+			{ key: "sepia", label: "Sepia", min: 0, max: 1, step: 0.02 },
 			{ key: "vignette", label: "Vignette", min: 0, max: 1, step: 0.02 },
+		],
+	},
+	{
+		title: "Split Toning",
+		items: [
+			{ key: "splitShadowHue", label: "Shadow Hue", min: 0, max: 360, step: 2, unit: "°" },
+			{ key: "splitShadowAmt", label: "Shadow Tint", min: 0, max: 1, step: 0.02 },
+			{ key: "splitHighlightHue", label: "Highlight Hue", min: 0, max: 360, step: 2, unit: "°" },
+			{ key: "splitHighlightAmt", label: "Highlight Tint", min: 0, max: 1, step: 0.02 },
 		],
 	},
 ];
@@ -53,18 +75,22 @@ const SLIDER_GROUPS: Array<{ title: string; items: SliderSpec[] }> = [
 /** Non-destructive GPU shader adjustment & geometry panel. */
 export function AdjustPanel({
 	adjustments,
+	activePresetName,
 	onChange,
 	onReset,
 	onBakeToBranch,
 	onOpenCrop,
+	onSaveAsPreset,
 	saving,
 	busy,
 }: {
 	adjustments: ImageAdjustments;
+	activePresetName?: string | null;
 	onChange: (next: ImageAdjustments) => void;
 	onReset: () => void;
 	onBakeToBranch: () => void;
 	onOpenCrop: () => void;
+	onSaveAsPreset?: () => void;
 	saving?: boolean;
 	busy?: boolean;
 }) {
@@ -83,6 +109,15 @@ export function AdjustPanel({
 					{saving ? "Saving…" : changed ? "Live GPU look" : "Original"}
 				</span>
 			</div>
+
+			{activePresetName && (
+				<div className="mb-3 flex items-center justify-between rounded-lg border border-indigo-400/30 bg-indigo-500/10 px-2.5 py-1.5 text-[11px]">
+					<span className="truncate text-indigo-200">Preset: {activePresetName}</span>
+					<span className="text-muted-foreground">
+						{Math.round((adjustments.presetIntensity ?? 1) * 100)}%
+					</span>
+				</div>
+			)}
 
 			{/* Quick transform bar */}
 			<div className="mb-4 flex flex-wrap gap-1.5">
@@ -173,7 +208,11 @@ export function AdjustPanel({
 											{s.label}
 										</button>
 										<span className="tabular-nums text-muted-foreground">
-											{val > 0 ? `+${val.toFixed(2)}` : val.toFixed(2)}
+											{s.unit
+												? `${Math.round(val)}${s.unit}`
+												: val > 0
+													? `+${val.toFixed(2)}`
+													: val.toFixed(2)}
 										</span>
 									</div>
 									<input
@@ -192,23 +231,35 @@ export function AdjustPanel({
 				))}
 			</div>
 
-			<div className="mt-5 flex items-center gap-2 border-t ed-hairline pt-3">
-				<button
-					type="button"
-					disabled={!changed || busy}
-					onClick={onBakeToBranch}
-					className="flex-1 rounded-full bg-foreground py-1.5 font-medium text-background transition hover:opacity-85 disabled:opacity-40"
-				>
-					Bake to new branch
-				</button>
-				<button
-					type="button"
-					disabled={!changed || busy}
-					onClick={onReset}
-					className="rounded-full border ed-hairline px-3 py-1.5 text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:opacity-40"
-				>
-					Reset
-				</button>
+			<div className="mt-5 space-y-2 border-t ed-hairline pt-3">
+				{onSaveAsPreset && (
+					<button
+						type="button"
+						disabled={!changed || busy}
+						onClick={onSaveAsPreset}
+						className="w-full rounded-full border border-indigo-400/40 bg-indigo-500/15 py-1.5 font-medium text-indigo-200 transition hover:bg-indigo-500/25 disabled:opacity-40"
+					>
+						+ Save current look as Preset
+					</button>
+				)}
+				<div className="flex items-center gap-2">
+					<button
+						type="button"
+						disabled={!changed || busy}
+						onClick={onBakeToBranch}
+						className="flex-1 rounded-full bg-foreground py-1.5 font-medium text-background transition hover:opacity-85 disabled:opacity-40"
+					>
+						Bake to new branch
+					</button>
+					<button
+						type="button"
+						disabled={!changed || busy}
+						onClick={onReset}
+						className="rounded-full border ed-hairline px-3 py-1.5 text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:opacity-40"
+					>
+						Reset
+					</button>
+				</div>
 			</div>
 		</div>
 	);

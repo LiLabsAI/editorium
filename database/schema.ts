@@ -131,6 +131,8 @@ export const imageVersions = sqliteTable(
 	model: text("model"),
 	fidelity: real("fidelity"),
 	adjustmentsJson: text("adjustments_json"),
+	presetId: text("preset_id"),
+	presetName: text("preset_name"),
 	createdAt: integer("created_at", { mode: "timestamp_ms" })
 		.notNull()
 		.default(now),
@@ -228,6 +230,8 @@ export const chatMessages = sqliteTable(
 	opClass: text("op_class"),
 	bboxJson: text("bbox_json"),
 	replyToId: text("reply_to_id"),
+	presetId: text("preset_id"),
+	presetName: text("preset_name"),
 	createdAt: integer("created_at", { mode: "timestamp_ms" })
 		.notNull()
 		.default(now),
@@ -419,6 +423,48 @@ export const imageAnnotations = sqliteTable(
 	(t) => [index("image_annotations_image_idx").on(t.imageId)],
 );
 
+/** User-saved filter, hidden-prompt AI effect, and hybrid presets. */
+export const presets = sqliteTable(
+	"presets",
+	{
+		id: text("id").primaryKey(),
+		projectId: text("project_id")
+			.notNull()
+			.references(() => projects.id, { onDelete: "cascade" }),
+		ownerId: text("owner_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		name: text("name").notNull(),
+		slug: text("slug").notNull(),
+		category: text("category").notNull().default("custom"),
+		kind: text("kind", { enum: ["filter", "ai_effect", "hybrid"] }).notNull(),
+		description: text("description").notNull().default(""),
+		adjustmentsJson: text("adjustments_json"),
+		promptTemplate: text("prompt_template"),
+		targetScope: text("target_scope", { enum: ["whole", "background", "subject", "selection"] })
+			.notNull()
+			.default("whole"),
+		opClass: text("op_class", { enum: ["reimagine", "style_transfer"] })
+			.notNull()
+			.default("reimagine"),
+		defaultIntensity: text("default_intensity", { enum: ["subtle", "balanced", "bold"] })
+			.notNull()
+			.default("balanced"),
+		isFavorite: integer("is_favorite", { mode: "boolean" }).notNull().default(false),
+		createdAt: integer("created_at", { mode: "timestamp_ms" })
+			.notNull()
+			.default(now),
+		updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+			.notNull()
+			.default(now),
+	},
+	(t) => [
+		index("presets_project_kind_idx").on(t.projectId, t.kind),
+		index("presets_owner_idx").on(t.ownerId),
+	],
+);
+
+export type PresetRow = typeof presets.$inferSelect;
 export type ImageAnnotation = typeof imageAnnotations.$inferSelect;
 export type User = typeof users.$inferSelect;
 export type Project = typeof projects.$inferSelect;

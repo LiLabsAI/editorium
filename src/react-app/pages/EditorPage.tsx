@@ -16,9 +16,13 @@ import {
 	type ImageDto,
 	type Me,
 	type PaletteDto,
+	type PresetDto,
+	type PresetIntensity,
+	type PresetKind,
 	type ReferenceDto,
 	type SegmentDto,
 } from "../lib/api";
+import { BUILT_IN_FILTER_PRESETS, interpolatePresetAdjustments } from "../../shared/presets";
 import { jobEvents } from "../lib/events";
 import { isPending } from "../lib/history";
 import { editorStore, useEditorState, type EditorTool } from "../lib/store";
@@ -27,6 +31,7 @@ import { BranchRail } from "../components/BranchRail";
 import { EditComposer } from "../components/EditComposer";
 import { HistoryPanel, type LiveTurn } from "../components/HistoryPanel";
 import { LayersDrawer } from "../components/LayersDrawer";
+import { PresetsPanel } from "../components/PresetsPanel";
 import { ShareDialog } from "../components/ShareDialog";
 import { TopBar } from "../components/TopBar";
 import { EditorCanvas, type CanvasHandle, type OutpaintPad } from "../editor/Canvas";
@@ -101,13 +106,17 @@ export function EditorPage({
 	const [maskPngBase64, setMaskPngBase64] = useState<string | null>(null);
 	const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null);
 	const [adjustments, setAdjustments] = useState<ImageAdjustments>({});
+	const [previewAdjustments, setPreviewAdjustments] = useState<ImageAdjustments | null>(null);
+	const [presets, setPresets] = useState<PresetDto[]>(BUILT_IN_FILTER_PRESETS);
+	const [photoSourceImg, setPhotoSourceImg] = useState<HTMLImageElement | null>(null);
+	const [initialPresetCreate, setInitialPresetCreate] = useState<{ kind: PresetKind; prompt?: string } | null>(null);
 	const [savingAdj, setSavingAdj] = useState(false);
 	const [outpaintPad, setOutpaintPad] = useState<OutpaintPad>({ top: 0, bottom: 0, left: 0, right: 0 });
 	const [textDraftPoint, setTextDraftPoint] = useState<NormPoint | null>(null);
 	const [textInput, setTextInput] = useState("");
 	const [textColor, setTextColor] = useState("#ffffff");
 
-	const [leftDrawer, setLeftDrawer] = useState<"none" | "layers" | "adjust">("none");
+	const [leftDrawer, setLeftDrawer] = useState<"none" | "layers" | "presets" | "adjust">("none");
 	const [showSegmentsOnCanvas, setShowSegmentsOnCanvas] = useState(false);
 	const [batchMode, setBatchMode] = useState(false);
 	const [enhancingPrompt, setEnhancingPrompt] = useState(false);
@@ -132,7 +141,22 @@ export function EditorPage({
 		setHighlights([]);
 		setOutpaintPad({ top: 0, bottom: 0, left: 0, right: 0 });
 		setTextDraftPoint(null);
+		setPreviewAdjustments(null);
+		setPhotoSourceImg(null);
 	}, [imageId]);
+
+	const loadPresets = useCallback(async () => {
+		try {
+			const res = await api.presets();
+			setPresets(res.presets);
+		} catch {
+			// Built-in GPU filters stay available even if presets endpoint fails.
+		}
+	}, []);
+
+	useEffect(() => {
+		void loadPresets();
+	}, [loadPresets]);
 
 	const loadPhoto = useCallback(async () => {
 		if (!albumId || !imageId) return;
@@ -231,6 +255,10 @@ export function EditorPage({
 				}
 				return;
 			}
+			if (e.key.toLowerCase() === "p" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+				setLeftDrawer((d) => (d === "presets" ? "none" : "presets"));
+				return;
+			}
 			const shortcut = TOOL_BUTTONS.find((t) => t.key.toLowerCase() === e.key.toLowerCase());
 			if (shortcut && !e.metaKey && !e.ctrlKey && !e.altKey) {
 				editorStore.set({ tool: shortcut.id });
@@ -281,7 +309,7 @@ export function EditorPage({
 		}, 350);
 	}
 
-	async function bakeAdjustmentsToBranch(label = "Color adjustment") {
+	async function bakeAdjustmentsToBranch(label = "Color adjustment", preset?: { id: string; name: string }) {
 		if (!image || busy) return;
 		setBusy(true);
 		setNotice(null);
@@ -289,13 +317,52 @@ export function EditorPage({
 			const origUrl = fileUrl(image.id, "original", image.currentVersionId ?? undefined);
 			const mime = image.mime === "image/png" ? "image/png" : "image/jpeg";
 			const blob = await bakeAdjustedBlob(origUrl, adjustments, annotations, mime);
-			const { imageId: newId } = await api.filterBranch(image.id, label, blob, JSON.stringify(adjustments));
+			const { imageId: newId } = await api.filterBranch(
+				image.id,
+				label,
+				blob,
+				JSON.stringify(adjustments),
+				preset,
+			);
 			open(newId);
 		} catch (err) {
 			setNotice(`${label} failed: ${describeError(err)}`);
 		} finally {
 			setBusy(false);
 		}
+	}
+
+	async function applyAiPreset({
+		preset,
+		intensity,
+		extraPrompt,
+	}: {
+		preset: PresetDto;
+		intensity: PresetIntensity;
+		extraPrompt?: string;
+	}) {
+		if (!image || busy) return;
+		const box = selection ?? undefined;
+		const maskB64 = maskPngBase64 ?? undefined;
+		const segId = selectedSegmentId ?? undefined;
+		if (selection) {
+			setSelection(null);
+			setMaskPngBase64(null);
+			setSelectedSegmentId(null);
+			canvasRef.current?.clearMask();
+		}
+		await startJob(() =>
+			api.applyPreset(image.id, {
+				presetId: preset.id,
+				intensity,
+				extraPrompt,
+				bbox: box,
+				maskPngBase64: maskB64,
+				segmentId: segId,
+				referenceImageIds: selectedRefIds.length ? selectedRefIds : undefined,
+				paletteIds: selectedPaletteIds.length ? selectedPaletteIds : undefined,
+			}),
+		);
 	}
 
 	async function regionEdit(text: string, box: Box, maskB64 = maskPngBase64, segId = selectedSegmentId) {
@@ -429,7 +496,16 @@ export function EditorPage({
 	function retry(turn: HistoryTurn) {
 		const on = turn.request.imageId;
 		if (!on) return;
-		const { text, opClass, bboxes } = turn.request;
+		const { text, opClass, bboxes, presetId } = turn.request;
+		if (presetId && opClass !== "adjust") {
+			void startJob(() =>
+				api.applyPreset(on, {
+					presetId,
+					...(bboxes[0] ? { bbox: bboxes[0] } : {}),
+				}),
+			);
+			return;
+		}
 		if (opClass === "enhance") void startJob(() => api.enhanceImage(on));
 		else if (opClass === "segment") void startJob(() => api.removeBackground(on));
 		else if (opClass === "reimagine" || opClass === "style_transfer") void startJob(() => api.editImage(on, text));
@@ -441,26 +517,11 @@ export function EditorPage({
 		}
 	}
 
-	/** Quick deterministic presets (B&W, Golden hour). */
-	async function applyFilter(kind: "bw" | "golden", label: string) {
-		if (!image || busy) return;
-		const preset: ImageAdjustments =
-			kind === "bw"
-				? { saturation: -1, contrast: 0.16, clarity: 0.1 }
-				: { temperature: 0.38, vibrance: 0.25, contrast: 0.08, vignette: 0.22 };
-		setBusy(true);
-		setNotice(null);
-		try {
-			const origUrl = fileUrl(image.id, "original", image.currentVersionId ?? undefined);
-			const mime = image.mime === "image/png" ? "image/png" : "image/jpeg";
-			const blob = await bakeAdjustedBlob(origUrl, { ...adjustments, ...preset }, annotations, mime);
-			const { imageId: newId } = await api.filterBranch(image.id, label, blob, JSON.stringify({ ...adjustments, ...preset }));
-			open(newId);
-		} catch (err) {
-			setNotice(`${label} failed: ${describeError(err)}`);
-		} finally {
-			setBusy(false);
-		}
+	/** Quick-apply a GPU filter preset live in WebGL2 and open Presets to adjust Amount or Bake. */
+	function applyQuickFilter(preset: PresetDto) {
+		if (!image || !preset.adjustments) return;
+		handleAdjustChange(interpolatePresetAdjustments(adjustments, preset.adjustments, 1, preset.id));
+		setLeftDrawer("presets");
 	}
 
 	async function extractSubject() {
@@ -580,6 +641,15 @@ export function EditorPage({
 	}
 
 	const selectedSegment = segments.find((s) => s.id === selectedSegmentId) ?? null;
+	const activePresetName = useMemo(
+		() => (adjustments.presetId ? presets.find((p) => p.id === adjustments.presetId)?.name ?? null : null),
+		[adjustments.presetId, presets],
+	);
+	const quickFilters = useMemo(() => {
+		const favs = presets.filter((p) => !p.isBuiltIn && p.isFavorite && p.kind === "filter");
+		if (favs.length > 0) return favs.slice(0, 2);
+		return presets.filter((p) => p.id === "builtin:portra-400" || p.id === "builtin:trix-400").slice(0, 2);
+	}, [presets]);
 	const lastPrompt = [...turns].reverse().find((t) => !t.derived && t.request.opClass !== "upload")?.request.text ?? null;
 	const quick = "rounded-full border ed-hairline bg-secondary px-3 py-1.5 text-xs transition hover:bg-muted disabled:opacity-40";
 	const outpaintTotal = outpaintPad.left + outpaintPad.right + outpaintPad.top + outpaintPad.bottom;
@@ -645,16 +715,19 @@ export function EditorPage({
 					busy={busy}
 				/>
 
-				{/* Optional Left Inspector Drawer (Layers | Adjust) */}
+				{/* Optional Left Inspector Drawer (Layers | Presets | Adjust) */}
 				{leftDrawer !== "none" && image && (
-					<aside className="ed-panel flex w-72 shrink-0 flex-col border-r ed-hairline">
-						<div className="flex items-center border-b ed-hairline px-3 py-2 text-xs">
-							{(["layers", "adjust"] as const).map((tab) => (
+					<aside className="ed-panel flex w-76 shrink-0 flex-col border-r ed-hairline">
+						<div className="flex items-center gap-0.5 border-b ed-hairline px-3 py-2 text-xs">
+							{(["layers", "presets", "adjust"] as const).map((tab) => (
 								<button
 									key={tab}
 									type="button"
-									onClick={() => setLeftDrawer(tab)}
-									className={`rounded-full px-3 py-1 capitalize ${
+									onClick={() => {
+										setLeftDrawer(tab);
+										setPreviewAdjustments(null);
+									}}
+									className={`rounded-full px-2.5 py-1 capitalize ${
 										leftDrawer === tab ? "bg-foreground font-medium text-background" : "text-muted-foreground hover:text-foreground"
 									}`}
 								>
@@ -664,7 +737,10 @@ export function EditorPage({
 							<button
 								type="button"
 								aria-label="Close inspector"
-								onClick={() => setLeftDrawer("none")}
+								onClick={() => {
+									setLeftDrawer("none");
+									setPreviewAdjustments(null);
+								}}
 								className="ml-auto rounded px-1.5 py-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
 							>
 								×
@@ -702,13 +778,49 @@ export function EditorPage({
 								busy={busy}
 								subjectBusy={subjectBusy}
 							/>
+						) : leftDrawer === "presets" ? (
+							<PresetsPanel
+								imageId={image.id}
+								photoSource={photoSourceImg}
+								presets={presets}
+								adjustments={adjustments}
+								hasSelection={Boolean(selection || maskPngBase64 || selectedSegmentId)}
+								selectionLabel={selectedSegment?.label ?? (maskPngBase64 ? "painted mask" : null)}
+								busy={busy}
+								initialCreateKind={initialPresetCreate?.kind ?? null}
+								initialCreatePrompt={initialPresetCreate?.prompt ?? null}
+								onConsumeInitialCreate={() => setInitialPresetCreate(null)}
+								onPreviewAdjustments={setPreviewAdjustments}
+								onApplyFilterAdjustments={handleAdjustChange}
+								onBakeFilterBranch={(label, preset) => void bakeAdjustmentsToBranch(label, preset)}
+								onResetAdjustments={() => {
+									setPreviewAdjustments(null);
+									handleAdjustChange({});
+								}}
+								onApplyAiPreset={(opts) => void applyAiPreset(opts)}
+								onRemixPrompt={(prompt) => setDraft(prompt)}
+								onPresetsChanged={() => void loadPresets()}
+								onNotice={setNotice}
+							/>
 						) : (
 							<AdjustPanel
 								adjustments={adjustments}
+								activePresetName={activePresetName}
 								onChange={handleAdjustChange}
 								onReset={() => handleAdjustChange({})}
-								onBakeToBranch={() => void bakeAdjustmentsToBranch()}
+								onBakeToBranch={() =>
+									void bakeAdjustmentsToBranch(
+										activePresetName ?? "Color adjustment",
+										adjustments.presetId && activePresetName
+											? { id: adjustments.presetId, name: activePresetName }
+											: undefined,
+									)
+								}
 								onOpenCrop={() => editorStore.set({ tool: "crop" })}
+								onSaveAsPreset={() => {
+									setInitialPresetCreate({ kind: "filter" });
+									setLeftDrawer("presets");
+								}}
 								saving={savingAdj}
 								busy={busy}
 							/>
@@ -796,6 +908,18 @@ export function EditorPage({
 							</button>
 							<button
 								type="button"
+								title="Filters & AI Effects Presets (P)"
+								aria-pressed={leftDrawer === "presets"}
+								onClick={() => {
+									setPreviewAdjustments(null);
+									setLeftDrawer((d) => (d === "presets" ? "none" : "presets"));
+								}}
+								className={`rounded-lg px-2 py-1 ${leftDrawer === "presets" ? "bg-indigo-500/25 font-medium text-indigo-200" : "text-muted-foreground hover:bg-muted"}`}
+							>
+								Presets
+							</button>
+							<button
+								type="button"
 								aria-pressed={leftDrawer === "adjust"}
 								onClick={() => setLeftDrawer((d) => (d === "adjust" ? "none" : "adjust"))}
 								className={`rounded-lg px-2 py-1 ${leftDrawer === "adjust" ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted"}`}
@@ -854,8 +978,9 @@ export function EditorPage({
 						<EditorCanvas
 							ref={canvasRef}
 							image={image}
-							adjustments={adjustments}
+							adjustments={previewAdjustments ?? adjustments}
 							onAdjustmentsChange={handleAdjustChange}
+							onImageLoaded={setPhotoSourceImg}
 							selection={selection}
 							onSelectionChange={(box) => {
 								setSelection(box);
@@ -912,18 +1037,35 @@ export function EditorPage({
 								setWantsRegion(true);
 							}}
 							onHighlight={setHighlights}
+							onSaveAsPreset={(prompt) => {
+								setInitialPresetCreate({ kind: "ai_effect", prompt });
+								setLeftDrawer("presets");
+							}}
 						/>
 					) : (
 						<div className="flex-1" />
 					)}
 					<div className="space-y-2 border-t ed-hairline p-3">
 						<div className="flex flex-wrap gap-1.5">
-							<button type="button" disabled={busy} onClick={() => void applyFilter("bw", "Black & white")} className={quick}>
-								Black & white
+							<button
+								type="button"
+								onClick={() => setLeftDrawer((d) => (d === "presets" ? "none" : "presets"))}
+								className="rounded-full border border-indigo-400/40 bg-indigo-500/15 px-3 py-1.5 text-xs font-medium text-indigo-200 transition hover:bg-indigo-500/25"
+							>
+								✦ Presets
 							</button>
-							<button type="button" disabled={busy} onClick={() => void applyFilter("golden", "Golden hour")} className={quick}>
-								Golden hour
-							</button>
+							{quickFilters.map((fp) => (
+								<button
+									key={fp.id}
+									type="button"
+									disabled={busy}
+									onClick={() => applyQuickFilter(fp)}
+									title={fp.description}
+									className={quick}
+								>
+									{fp.name}
+								</button>
+							))}
 							<button
 								type="button"
 								disabled={busy || !image}

@@ -13,13 +13,15 @@ import {
 	type ImageRow,
 } from "../../database/schema";
 import { notifyUserEvent } from "./events";
-import { WORKING_MAX_PX } from "./lib/config";
+import { MAX_MASK_PX, WORKING_MAX_PX } from "./lib/config";
 import { createDb } from "./lib/db";
-import { assertFidelity, toPixelBox, type OperationClass } from "./lib/fidelity";
+import { assertFidelity, similarity, toPixelBox, type OperationClass } from "./lib/fidelity";
 import { finishJob } from "./lib/jobs";
-import { buildAlphaMask, buildOutpaintInnerMask } from "./lib/mask";
+import { buildAlphaMask, buildOutpaintInnerMask, encodePng } from "./lib/mask";
 import { loadModelInput, loadWorkingImage, logWarn, storeOperationResult } from "./lib/operations";
 import { pixelOps, type PixelBox } from "./lib/pixels";
+import { decodePng } from "./lib/png";
+import type { PresetTargetScope } from "../shared/presets";
 import {
 	closestAspect,
 	editDims,
@@ -205,7 +207,17 @@ async function store(
 	albumId: string,
 	source: ImageRow | null,
 	result: { data: ArrayBuffer; mime: string; width?: number; height?: number },
-	meta: { operation: string; label: string; prompt?: string; opClass: OperationClass; model: string; fidelity: number | null },
+	meta: {
+		operation: string;
+		label: string;
+		prompt?: string;
+		adjustmentsJson?: string | null;
+		presetId?: string | null;
+		presetName?: string | null;
+		opClass: OperationClass;
+		model: string;
+		fidelity: number | null;
+	},
 ): Promise<JobResult> {
 	return storeOperationResult(env, {
 		userId,
@@ -214,6 +226,9 @@ async function store(
 		operation: meta.operation,
 		label: meta.label,
 		prompt: meta.prompt,
+		adjustmentsJson: meta.adjustmentsJson ?? null,
+		presetId: meta.presetId ?? null,
+		presetName: meta.presetName ?? null,
 		result: { data: result.data, mime: result.mime, width: result.width ?? 0, height: result.height ?? 0 },
 		audit: { opClass: meta.opClass, model: meta.model, fidelity: meta.fidelity },
 	});
@@ -371,6 +386,11 @@ export async function runLocalEdit(
 	source: ImageRow,
 	regions: LocalRegionSpec[],
 	label: string,
+	meta?: {
+		presetId?: string | null;
+		presetName?: string | null;
+		adjustmentsJson?: string | null;
+	},
 ): Promise<JobResult> {
 	const ops = pixelOps(env);
 	const provider = getProvider(env);
@@ -420,9 +440,12 @@ export async function runLocalEdit(
 	}
 	const score = await assertFidelity(ops, "local", working.bytes, current, { regions: changed });
 	return store(env, userId, source.albumId, source, { data: current, mime: currentMime }, {
-		operation: "edit",
+		operation: meta?.presetId ? "preset" : "edit",
 		label,
 		prompt: regions.map((r) => r.text).join("; "),
+		adjustmentsJson: meta?.adjustmentsJson ?? null,
+		presetId: meta?.presetId ?? null,
+		presetName: meta?.presetName ?? null,
 		opClass: "local",
 		model,
 		fidelity: score?.fidelity ?? null,
@@ -502,6 +525,15 @@ export async function runWholePhotoEdit(
 	prompt: string,
 	origin?: string,
 	referenceImageIds?: string[],
+	opts?: {
+		label?: string;
+		opClassOverride?: "reimagine" | "style_transfer";
+		preferredModel?: "primary" | "flux";
+		presetId?: string | null;
+		presetName?: string | null;
+		adjustmentsJson?: string | null;
+		skipPreservationAppend?: boolean;
+	},
 ): Promise<JobResult> {
 	const ops = pixelOps(env);
 	const provider = getProvider(env);
@@ -510,25 +542,29 @@ export async function runWholePhotoEdit(
 	const dims = editDims(width, height);
 	const extra = await loadExtraReferences(env, ops, userId, referenceImageIds, origin);
 	const hasRefs = extra.buffers.length > 0;
-	const opClass: OperationClass = hasRefs ? "style_transfer" : "reimagine";
+	const opClass: OperationClass = opts?.opClassOverride ?? (hasRefs ? "style_transfer" : "reimagine");
+	const label = opts?.label?.trim() || prompt.slice(0, 40) || "Reimagined";
+	const operation = opts?.presetId ? "preset" : "edit";
 
-	if (provider.editWithPrimary && !isMock(env)) {
+	if (provider.editWithPrimary && !isMock(env) && opts?.preferredModel !== "flux") {
 		const primaryUrl = origin?.startsWith("https://")
 			? `${origin}${await signPublicImageUrl(env, source.id)}?norm=1`
 			: toDataUri(working.bytes, working.mime);
 		const sources = [primaryUrl, ...extra.urls];
+		const primaryPrompt = opts?.skipPreservationAppend
+			? prompt
+			: `${prompt}. Keep the rest of the photograph exactly unchanged.`;
 		try {
-			const editedPrimary = await provider.editWithPrimary(
-				sources,
-				`${prompt}. Keep the rest of the photograph exactly unchanged.`,
-				closestAspect(width, height),
-			);
+			const editedPrimary = await provider.editWithPrimary(sources, primaryPrompt, closestAspect(width, height));
 			if (editedPrimary) {
 				const score = await assertFidelity(ops, opClass, working.bytes, editedPrimary.data);
 				return store(env, userId, source.albumId, source, editedPrimary, {
-					operation: "edit",
-					label: prompt.slice(0, 40) || "Reimagined",
+					operation,
+					label,
 					prompt,
+					adjustmentsJson: opts?.adjustmentsJson ?? null,
+					presetId: opts?.presetId ?? null,
+					presetName: opts?.presetName ?? null,
 					opClass,
 					model: editedPrimary.model,
 					fidelity: score?.fidelity ?? null,
@@ -541,22 +577,225 @@ export async function runWholePhotoEdit(
 
 	const ref = referenceDims(width, height);
 	const reference = await ops.resize(working.bytes, ref.width, ref.height);
-	const edited = await provider.editWithReference(
-		reference,
-		hasRefs
+	const fluxPrompt = opts?.skipPreservationAppend
+		? prompt
+		: hasRefs
 			? `${prompt}. Transfer style/details from the attached reference images while preserving composition.`
-			: `${prompt}. Keep the people, composition, framing and lighting the same.`,
-		dims,
-		extra.buffers,
-	);
+			: `${prompt}. Keep the people, composition, framing and lighting the same.`;
+	const edited = await provider.editWithReference(reference, fluxPrompt, dims, extra.buffers);
 	const score = await assertFidelity(ops, opClass, working.bytes, edited.data);
 	return store(env, userId, source.albumId, source, edited, {
-		operation: "edit",
-		label: prompt.slice(0, 40) || "Reimagined",
+		operation,
+		label,
 		prompt,
+		adjustmentsJson: opts?.adjustmentsJson ?? null,
+		presetId: opts?.presetId ?? null,
+		presetName: opts?.presetName ?? null,
 		opClass,
 		model: edited.model,
 		fidelity: score?.fidelity ?? null,
+	});
+}
+
+export interface RunPresetJobOpts {
+	presetId: string;
+	presetName: string;
+	prompt: string;
+	targetScope: PresetTargetScope;
+	opClass: "reimagine" | "style_transfer";
+	preferredModel?: "primary" | "flux";
+	finishingAdjustmentsJson?: string | null;
+	regionBox?: Box;
+	maskR2Key?: string;
+	segmentId?: string;
+	referenceImageIds?: string[];
+	origin?: string;
+}
+
+/**
+ * Execute an AI Effect or Hybrid preset.
+ * - Active selection (box / mask / segment) -> local masked composite.
+ * - Background or Subject preset scope -> automatic BiRefNet subject mask so
+ *   foreground subject pixels (or background pixels) stay mathematically intact.
+ * - Whole photo -> fidelity-guarded Pruna/FLUX pass + optional live hybrid GPU grade.
+ */
+export async function runPresetJob(
+	env: Env,
+	userId: string,
+	source: ImageRow,
+	opts: RunPresetJobOpts,
+): Promise<JobResult> {
+	// 1. Explicit user selection (segment, mask, or box) overrides preset scope.
+	if (opts.segmentId) {
+		const db = createDb(env.DB);
+		const [segment] = await db
+			.select()
+			.from(segments)
+			.where(and(eq(segments.id, opts.segmentId), eq(segments.imageId, source.id), isNull(segments.deletedAt)))
+			.limit(1);
+		if (!segment) throw new ProviderError("segment not found");
+		if (segment.lockedAt) throw new ProviderError("segment is locked");
+		return runLocalEdit(
+			env,
+			userId,
+			source,
+			[
+				{
+					text: opts.prompt,
+					box: { x: segment.bboxX, y: segment.bboxY, w: segment.bboxW, h: segment.bboxH },
+					maskR2Key: segment.maskR2Key ?? undefined,
+					referenceImageIds: opts.referenceImageIds,
+				},
+			],
+			`${opts.presetName} (${segment.label})`,
+			{
+				presetId: opts.presetId,
+				presetName: opts.presetName,
+				adjustmentsJson: opts.finishingAdjustmentsJson ?? null,
+			},
+		);
+	}
+
+	if (opts.regionBox || opts.maskR2Key) {
+		return runLocalEdit(
+			env,
+			userId,
+			source,
+			[
+				{
+					text: opts.prompt,
+					box: opts.regionBox ?? { x: 0, y: 0, w: 1, h: 1 },
+					maskR2Key: opts.maskR2Key,
+					referenceImageIds: opts.referenceImageIds,
+				},
+			],
+			opts.presetName,
+			{
+				presetId: opts.presetId,
+				presetName: opts.presetName,
+				adjustmentsJson: opts.finishingAdjustmentsJson ?? null,
+			},
+		);
+	}
+
+	// 2. Auto BiRefNet subject-protected scope ("background" or "subject").
+	if (opts.targetScope === "background" || opts.targetScope === "subject") {
+		const ops = pixelOps(env);
+		const provider = getProvider(env);
+		const working = await loadWorkingImage(env, source);
+		const { width, height } = await ops.dims(working.bytes);
+
+		let subjectMaskPng: ArrayBuffer | null = null;
+		try {
+			const cutout = await ops.removeBackground(working.bytes);
+			const maskScale = Math.min(1, MAX_MASK_PX / Math.max(width, height));
+			const mw = Math.max(1, Math.round(width * maskScale));
+			const mh = Math.max(1, Math.round(height * maskScale));
+			const smallCutout =
+				mw === width && mh === height ? cutout : await ops.resize(cutout.bytes, mw, mh);
+			const rgba = await decodePng(smallCutout.bytes);
+			const total = rgba.width * rgba.height;
+			let fgCount = 0;
+			const maskData = new Uint8Array(total * 4);
+			for (let i = 0; i < total; i++) {
+				const a = rgba.data[i * 4 + 3] ?? 0;
+				if (a > 128) fgCount++;
+				maskData[i * 4] = 255;
+				maskData[i * 4 + 1] = 255;
+				maskData[i * 4 + 2] = 255;
+				maskData[i * 4 + 3] = a;
+			}
+			const fgRatio = total > 0 ? fgCount / total : 0;
+			if (fgRatio >= 0.02 && fgRatio <= 0.95) {
+				subjectMaskPng = await encodePng(rgba.width, rgba.height, 4, maskData);
+			}
+		} catch (error) {
+			logWarn("preset_subject_mask_failed", error, { imageId: source.id, presetId: opts.presetId });
+		}
+
+		if (subjectMaskPng) {
+			const dims = editDims(width, height);
+			const extra = await loadExtraReferences(env, ops, userId, opts.referenceImageIds, opts.origin);
+			let editedBytes: ArrayBuffer | null = null;
+			let model = "";
+
+			if (provider.editWithPrimary && !isMock(env) && opts.preferredModel !== "flux") {
+				const primaryUrl = opts.origin?.startsWith("https://")
+					? `${opts.origin}${await signPublicImageUrl(env, source.id)}?norm=1`
+					: toDataUri(working.bytes, working.mime);
+				try {
+					const primaryRes = await provider.editWithPrimary(
+						[primaryUrl, ...extra.urls],
+						opts.prompt,
+						closestAspect(width, height),
+					);
+					if (primaryRes) {
+						editedBytes = primaryRes.data;
+						model = primaryRes.model;
+					}
+				} catch (error) {
+					logWarn("pruna_preset_bg_failed", error, { imageId: source.id, presetId: opts.presetId });
+				}
+			}
+
+			if (!editedBytes) {
+				const ref = referenceDims(width, height);
+				const reference = await ops.resize(working.bytes, ref.width, ref.height);
+				const res = await provider.editWithReference(reference, opts.prompt, dims, extra.buffers);
+				editedBytes = res.data;
+				model = res.model;
+			}
+
+			// Verify model output itself is grounded in the source photo before compositing.
+			await assertFidelity(ops, opts.opClass, working.bytes, editedBytes);
+
+			const editedFull = await ops.resize(editedBytes, width, height);
+			const fullBox: PixelBox = { left: 0, top: 0, width, height };
+			// "background" keeps original subject pixels untouched over AI background;
+			// "subject" pastes AI subject over untouched original background.
+			const composed =
+				opts.targetScope === "background"
+					? await ops.composite(editedFull.bytes, working.bytes, subjectMaskPng, fullBox)
+					: await ops.composite(working.bytes, editedFull.bytes, subjectMaskPng, fullBox);
+
+			const [srcThumb, cmpThumb, maskThumb] = await Promise.all([
+				ops.thumbnail(working.bytes, 32),
+				ops.thumbnail(composed.bytes, 32),
+				ops.thumbnail(subjectMaskPng, 32),
+			]);
+			const keepSubject = opts.targetScope === "background";
+			const preserved = similarity(srcThumb, cmpThumb, (i) =>
+				keepSubject ? (maskThumb.data[i * 4 + 3] ?? 0) > 128 : (maskThumb.data[i * 4 + 3] ?? 0) <= 128,
+			);
+			if (preserved.n > 0 && (preserved.r < 0.85 || preserved.mad > 30)) {
+				throw new ProviderError(
+					`fidelity_check_failed: preserved region altered during preset (${opts.targetScope}: r=${preserved.r}, mad=${preserved.mad})`,
+				);
+			}
+
+			return store(env, userId, source.albumId, source, { data: composed.bytes, mime: composed.mime, width, height }, {
+				operation: "preset",
+				label: opts.presetName,
+				prompt: opts.prompt,
+				adjustmentsJson: opts.finishingAdjustmentsJson ?? null,
+				presetId: opts.presetId,
+				presetName: opts.presetName,
+				opClass: opts.opClass,
+				model: `${model}+birefnet`,
+				fidelity: preserved.fidelity,
+			});
+		}
+	}
+
+	// 3. Whole-photo preset (or fallback when no foreground/background separation exists).
+	return runWholePhotoEdit(env, userId, source, opts.prompt, opts.origin, opts.referenceImageIds, {
+		label: opts.presetName,
+		opClassOverride: opts.opClass,
+		preferredModel: opts.preferredModel,
+		presetId: opts.presetId,
+		presetName: opts.presetName,
+		adjustmentsJson: opts.finishingAdjustmentsJson ?? null,
+		skipPreservationAppend: true,
 	});
 }
 

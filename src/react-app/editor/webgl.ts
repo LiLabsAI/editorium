@@ -15,6 +15,7 @@ out vec4 outColor;
 
 uniform sampler2D u_tex;
 uniform vec2 u_texel;
+uniform vec2 u_size;
 uniform float u_exposure;
 uniform float u_contrast;
 uniform float u_highlights;
@@ -25,9 +26,36 @@ uniform float u_vibrance;
 uniform float u_saturation;
 uniform float u_clarity;
 uniform float u_vignette;
+uniform float u_fade;
+uniform float u_grain;
+uniform float u_sepia;
+uniform float u_bloom;
+uniform float u_splitShadowHue;
+uniform float u_splitShadowAmt;
+uniform float u_splitHighlightHue;
+uniform float u_splitHighlightAmt;
 
 float luma(vec3 c) {
 	return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 hueToRgb(float deg) {
+	float h = mod(deg, 360.0) / 60.0;
+	float x = 1.0 - abs(mod(h, 2.0) - 1.0);
+	vec3 rgb =
+		h < 1.0 ? vec3(1.0, x, 0.0) :
+		h < 2.0 ? vec3(x, 1.0, 0.0) :
+		h < 3.0 ? vec3(0.0, 1.0, x) :
+		h < 4.0 ? vec3(0.0, x, 1.0) :
+		h < 5.0 ? vec3(x, 0.0, 1.0) :
+		vec3(1.0, 0.0, x);
+	return rgb;
+}
+
+float hash12(vec2 p) {
+	vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+	p3 += dot(p3, p3.yzx + 33.33);
+	return fract((p3.x + p3.y) * p3.z);
 }
 
 vec3 applyGrades(vec3 c) {
@@ -52,7 +80,14 @@ vec3 applyGrades(vec3 c) {
 	c = (c - 0.5) * cf + 0.5;
 	c = clamp(c, 0.0, 1.0);
 
-	// Vibrance (protects already-saturated colors)
+	// Matte / lifted blacks film curve
+	if (u_fade > 0.005) {
+		float lift = u_fade * 0.16;
+		c = c * (1.0 - lift * 0.75) + vec3(lift);
+		c = clamp(c, 0.0, 1.0);
+	}
+
+	// Vibrance (protects already-saturated colors) & Saturation
 	float mx = max(c.r, max(c.g, c.b));
 	float mn = min(c.r, min(c.g, c.b));
 	float curSat = mx - mn;
@@ -60,7 +95,33 @@ vec3 applyGrades(vec3 c) {
 	float y2 = luma(c);
 	c = mix(vec3(y2), c, max(0.0, 1.0 + vibWeight + u_saturation));
 	c = clamp(c, 0.0, 1.0);
-	return c;
+
+	// Archival warm sepia toning
+	if (u_sepia > 0.005) {
+		vec3 sep = vec3(
+			dot(c, vec3(0.393, 0.769, 0.189)),
+			dot(c, vec3(0.349, 0.686, 0.168)),
+			dot(c, vec3(0.272, 0.534, 0.131))
+		);
+		c = mix(c, clamp(sep, 0.0, 1.0), u_sepia);
+	}
+
+	// Split toning (independent shadow & highlight color tints)
+	if (u_splitShadowAmt > 0.005 || u_splitHighlightAmt > 0.005) {
+		float yt = luma(c);
+		if (u_splitShadowAmt > 0.005) {
+			float sm = (1.0 - smoothstep(0.08, 0.62, yt)) * u_splitShadowAmt * 0.35;
+			vec3 sc = hueToRgb(u_splitShadowHue);
+			c = mix(c, clamp(c + (sc - 0.5) * 0.55, 0.0, 1.0), sm);
+		}
+		if (u_splitHighlightAmt > 0.005) {
+			float hm = smoothstep(0.38, 0.92, yt) * u_splitHighlightAmt * 0.35;
+			vec3 hc = hueToRgb(u_splitHighlightHue);
+			c = mix(c, clamp(c + (hc - 0.5) * 0.55, 0.0, 1.0), hm);
+		}
+	}
+
+	return clamp(c, 0.0, 1.0);
 }
 
 void main() {
@@ -79,7 +140,34 @@ void main() {
 		rgb = clamp(rgb + (rgb - blur) * (u_clarity * 0.9), 0.0, 1.0);
 	}
 
+	// Pro-Mist / halation soft glow on bright highlights (8-tap radial blur)
+	if (u_bloom > 0.005) {
+		vec3 glow = vec3(0.0);
+		vec2 r1 = u_texel * 3.5;
+		vec2 r2 = u_texel * 7.0;
+		vec3 s0 = texture(u_tex, uv + vec2(r1.x, 0.0)).rgb;
+		vec3 s1 = texture(u_tex, uv - vec2(r1.x, 0.0)).rgb;
+		vec3 s2 = texture(u_tex, uv + vec2(0.0, r1.y)).rgb;
+		vec3 s3 = texture(u_tex, uv - vec2(0.0, r1.y)).rgb;
+		vec3 s4 = texture(u_tex, uv + vec2(r2.x, r2.y) * 0.707).rgb;
+		vec3 s5 = texture(u_tex, uv + vec2(-r2.x, r2.y) * 0.707).rgb;
+		vec3 s6 = texture(u_tex, uv + vec2(r2.x, -r2.y) * 0.707).rgb;
+		vec3 s7 = texture(u_tex, uv + vec2(-r2.x, -r2.y) * 0.707).rgb;
+		glow += max(s0 - 0.55, 0.0) + max(s1 - 0.55, 0.0) + max(s2 - 0.55, 0.0) + max(s3 - 0.55, 0.0);
+		glow += (max(s4 - 0.55, 0.0) + max(s5 - 0.55, 0.0) + max(s6 - 0.55, 0.0) + max(s7 - 0.55, 0.0)) * 0.75;
+		glow /= 7.0;
+		rgb = clamp(rgb + glow * (u_bloom * 0.85), 0.0, 1.0);
+	}
+
 	rgb = applyGrades(rgb);
+
+	// Deterministic luminance-weighted organic film grain
+	if (u_grain > 0.005) {
+		float gNoise = hash12(floor(v_uv * u_size)) - 0.5;
+		float yg = luma(rgb);
+		float midWeight = 1.0 - abs(yg - 0.5) * 1.1;
+		rgb = clamp(rgb + vec3(gNoise * u_grain * 0.24 * max(0.35, midWeight)), 0.0, 1.0);
+	}
 
 	if (u_vignette > 0.005) {
 		float d = distance(uv, vec2(0.5)) * 1.4142;
@@ -134,6 +222,12 @@ export function hasNonZeroAdjustments(adj: ImageAdjustments | null | undefined):
 			adj.saturation ||
 			adj.clarity ||
 			adj.vignette ||
+			adj.fade ||
+			adj.grain ||
+			adj.sepia ||
+			adj.bloom ||
+			adj.splitShadowAmt ||
+			adj.splitHighlightAmt ||
 			adj.straighten ||
 			adj.rotate90 ||
 			adj.flipH ||
@@ -225,6 +319,7 @@ export class GlImageRenderer {
 			gl.bindTexture(gl.TEXTURE_2D, this.tex);
 			gl.uniform1i(gl.getUniformLocation(this.prog, "u_tex"), 0);
 			gl.uniform2f(gl.getUniformLocation(this.prog, "u_texel"), 1 / this.texW, 1 / this.texH);
+			gl.uniform2f(gl.getUniformLocation(this.prog, "u_size"), w, h);
 			gl.uniform1f(gl.getUniformLocation(this.prog, "u_exposure"), adj.exposure ?? 0);
 			gl.uniform1f(gl.getUniformLocation(this.prog, "u_contrast"), adj.contrast ?? 0);
 			gl.uniform1f(gl.getUniformLocation(this.prog, "u_highlights"), adj.highlights ?? 0);
@@ -235,6 +330,14 @@ export class GlImageRenderer {
 			gl.uniform1f(gl.getUniformLocation(this.prog, "u_saturation"), adj.saturation ?? 0);
 			gl.uniform1f(gl.getUniformLocation(this.prog, "u_clarity"), adj.clarity ?? 0);
 			gl.uniform1f(gl.getUniformLocation(this.prog, "u_vignette"), adj.vignette ?? 0);
+			gl.uniform1f(gl.getUniformLocation(this.prog, "u_fade"), adj.fade ?? 0);
+			gl.uniform1f(gl.getUniformLocation(this.prog, "u_grain"), adj.grain ?? 0);
+			gl.uniform1f(gl.getUniformLocation(this.prog, "u_sepia"), adj.sepia ?? 0);
+			gl.uniform1f(gl.getUniformLocation(this.prog, "u_bloom"), adj.bloom ?? 0);
+			gl.uniform1f(gl.getUniformLocation(this.prog, "u_splitShadowHue"), adj.splitShadowHue ?? 0);
+			gl.uniform1f(gl.getUniformLocation(this.prog, "u_splitShadowAmt"), adj.splitShadowAmt ?? 0);
+			gl.uniform1f(gl.getUniformLocation(this.prog, "u_splitHighlightHue"), adj.splitHighlightHue ?? 0);
+			gl.uniform1f(gl.getUniformLocation(this.prog, "u_splitHighlightAmt"), adj.splitHighlightAmt ?? 0);
 			gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 			gl.bindVertexArray(null);
 			return;
@@ -247,7 +350,8 @@ export class GlImageRenderer {
 		const b = 1 + (adj.exposure ?? 0) * 0.35;
 		const c = 1 + (adj.contrast ?? 0) * 0.6;
 		const s = Math.max(0, 1 + (adj.saturation ?? 0) * 0.8 + (adj.vibrance ?? 0) * 0.4);
-		ctx.filter = `brightness(${b}) contrast(${c}) saturate(${s})`;
+		const sep = Math.min(1, (adj.sepia ?? 0) + Math.max(0, (adj.temperature ?? 0) * 0.25));
+		ctx.filter = `brightness(${b}) contrast(${c}) saturate(${s}) sepia(${sep})`;
 		ctx.drawImage(this.source, 0, 0, w, h);
 		ctx.filter = "none";
 	}
@@ -416,4 +520,49 @@ export function extractImageColors(img: HTMLImageElement | HTMLCanvasElement, co
 	}
 	const hex = (n: number) => n.toString(16).padStart(2, "0");
 	return picked.map((p) => `#${hex(p.r)}${hex(p.g)}${hex(p.b)}`);
+}
+
+/**
+ * Render live WebGL2 filter thumbnail previews on the user's actual photo using
+ * ONE shared offscreen canvas/context so GPU memory stays minimal and fast.
+ */
+export function renderPresetThumbnails(
+	source: HTMLImageElement | HTMLCanvasElement,
+	presets: Array<{ id: string; adjustments?: ImageAdjustments }>,
+	maxSide = 160,
+): Record<string, string> {
+	const natW = source instanceof HTMLImageElement ? source.naturalWidth : source.width;
+	const natH = source instanceof HTMLImageElement ? source.naturalHeight : source.height;
+	if (natW <= 0 || natH <= 0 || presets.length === 0) return {};
+
+	const scale = Math.min(1, maxSide / Math.max(natW, natH));
+	const w = Math.max(24, Math.round(natW * scale));
+	const h = Math.max(24, Math.round(natH * scale));
+
+	// Downscale once so texture upload is tiny (~160px).
+	const small = document.createElement("canvas");
+	small.width = w;
+	small.height = h;
+	const sctx = small.getContext("2d");
+	if (!sctx) return {};
+	sctx.drawImage(source, 0, 0, w, h);
+
+	const out: Record<string, string> = {};
+	const canvas = document.createElement("canvas");
+	const renderer = new GlImageRenderer(canvas);
+	try {
+		renderer.setSource(small);
+		for (const item of presets) {
+			if (!item.adjustments) continue;
+			renderer.render(item.adjustments, w, h);
+			try {
+				out[item.id] = canvas.toDataURL("image/jpeg", 0.78);
+			} catch {
+				// Ignore tainted canvas errors in headless environments.
+			}
+		}
+	} finally {
+		renderer.dispose();
+	}
+	return out;
 }

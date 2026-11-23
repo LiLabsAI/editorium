@@ -229,6 +229,8 @@ export interface NewImage {
 	operation: string;
 	prompt?: string;
 	adjustmentsJson?: string | null;
+	presetId?: string | null;
+	presetName?: string | null;
 	/** Dimensions reported by a model; only used if the bytes can't be probed. */
 	fallbackDims?: Dims;
 	audit?: VersionAudit;
@@ -307,6 +309,8 @@ export async function createImageFromBytes(
 				model: opts.audit?.model,
 				fidelity: opts.audit?.fidelity ?? null,
 				adjustmentsJson: opts.adjustmentsJson ?? null,
+				presetId: opts.presetId ?? null,
+				presetName: opts.presetName ?? null,
 			}),
 		]);
 		return { image: inserted[0]!, imageId, versionId };
@@ -329,6 +333,9 @@ export async function storeOperationResult(
 		operation: string;
 		label: string;
 		prompt?: string;
+		adjustmentsJson?: string | null;
+		presetId?: string | null;
+		presetName?: string | null;
 		result: GeneratedImage;
 		audit: VersionAudit;
 	},
@@ -343,6 +350,9 @@ export async function storeOperationResult(
 		rootImageId: opts.source ? (opts.source.rootImageId ?? opts.source.id) : null,
 		operation: opts.operation,
 		prompt: opts.prompt,
+		adjustmentsJson: opts.adjustmentsJson ?? null,
+		presetId: opts.presetId ?? null,
+		presetName: opts.presetName ?? null,
 		fallbackDims: { width: opts.result.width, height: opts.result.height },
 		audit: opts.audit,
 	});
