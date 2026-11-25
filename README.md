@@ -157,7 +157,7 @@ pnpm exec wrangler rollback
 ## Contributing
 
 Contributions, bug reports, forks, and pull requests are welcome!
-1. Fork [LiLabsAI/editorium](https://github.com/LiLabsAI/editorium) and create a feature branch.
+1. Fork [aliahadmd/editorium](https://github.com/aliahadmd/editorium) and create a feature branch.
 2. Keep changes covered by unit or Worker integration tests (`pnpm test:app` / `pnpm test:worker`).
 3. Ensure `pnpm check` exits cleanly with zero warnings before submitting your PR.
 
@@ -165,7 +165,7 @@ Contributions, bug reports, forks, and pull requests are welcome!
 
 ## License
 
-Copyright (C) 2026 Ali Ahad / [LiLabsAI](https://github.com/LiLabsAI).
+Copyright (C) 2026 [Ali Ahad](https://github.com/aliahadmd).
 
 Editorium is free software licensed under the **GNU General Public License v3.0 (GPL-3.0)** — see [`LICENSE`](./LICENSE) for the full license text.
 

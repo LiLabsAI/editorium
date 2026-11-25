@@ -3,11 +3,11 @@
 	"version": "0.1.0",
 	"description": "Editorium — an AI photo editor on Cloudflare Workers",
 	"license": "GPL-3.0-only",
-	"author": "Ali Ahad (LiLabsAI)",
+	"author": "Ali Ahad",
 	"homepage": "https://editorium.aliahad.workers.dev",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/LiLabsAI/editorium.git"
+		"url": "git+https://github.com/aliahadmd/editorium.git"
 	},
 	"private": true,
 	"packageManager": "pnpm@11.5.0",
